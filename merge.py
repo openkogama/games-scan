@@ -10,8 +10,20 @@ CDN = "https://cdn.openkogama.org/"
 DB_URL = "https://github.com/imuarte/kogama-game-list/releases/download/games-v1.0.0/kogama_games_merged.db"
 DB = "kogama_games_merged.db"
 LISTS = {"games_www.txt": "www", "games_br.txt": "br", "games_friends.txt": "friends", "output.txt": ""}
+ENTITY = re.compile(r"&(#[0-9]+|[a-zA-Z]+);")
 PAIR = re.compile(r"^(?P<name>.*):(?P<id>[0-9]{2,9})(?::(?P<author>.*))?$")
 FIELDS = ("title", "description", "author", "author_id", "likes", "plays", "created_date", "published_date", "scraped_at", "status")
+
+
+def clean(text):
+    for _ in range(4):
+        if not text or not ENTITY.search(text):
+            break
+        plain = html.unescape(text)
+        if plain == text:
+            break
+        text = plain
+    return text
 
 
 def shards():
@@ -37,10 +49,10 @@ def lists():
             m = PAIR.match(line.strip())
             if not m:
                 continue
-            name = html.unescape(m["name"]).strip()
+            name = clean(m["name"]).strip()
             by_id[m["id"]] = name
             if m["author"]:
-                authors[m["id"]] = html.unescape(m["author"]).strip()
+                authors[m["id"]] = clean(m["author"]).strip()
             key = (site, name.lower())
             names[key] = None if key in names else m["id"]
     return by_id, names, authors
@@ -84,10 +96,10 @@ def main():
             {
                 "id": gid,
                 "site": site,
-                "name": name,
+                "name": clean(name),
                 "authorId": str(rec["authorId"] or db.get("author_id") or ""),
-                "authorName": authors.get(gid, "") or (db.get("author") or ""),
-                "description": db.get("description") or "",
+                "authorName": clean(authors.get(gid, "") or (db.get("author") or "")),
+                "description": clean(db.get("description") or ""),
                 "likes": db.get("likes"),
                 "plays": db.get("plays"),
                 "createdDate": db.get("created_date") or "",

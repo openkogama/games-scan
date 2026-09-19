@@ -84,6 +84,8 @@ def header(data):
 def describe(data, name, sources):
     plain = VERSIONED.sub("", os.path.basename(name))
     stem, ext = os.path.splitext(plain)
+    if not ext:
+        stem, ext = "", "." + plain.rsplit(".", 1)[-1]
     ext = ext.lower()
     version, meta = header(data) if ext == ".kgmap" else (0, {})
     return {
@@ -166,8 +168,9 @@ def main():
     os.makedirs("out", exist_ok=True)
     results = []
     for i, f in enumerate(mine, 1):
-        item, name = f["paths"][0]
-        sources = [url_of(*p) for p in f["paths"]]
+        paths = sorted(f["paths"], key=lambda p: not NUMERIC.match(os.path.splitext(os.path.basename(VERSIONED.sub("", p[1])))[0]))
+        item, name = paths[0]
+        sources = [url_of(*p) for p in paths]
         print(f"[{i}/{len(mine)}] {item}/{name}", flush=True)
         ext = os.path.splitext(VERSIONED.sub("", name))[1].lower()
         try:
