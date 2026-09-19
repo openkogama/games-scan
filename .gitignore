@@ -1,0 +1,4 @@
+out/
+games.json
+*.db
+__pycache__/

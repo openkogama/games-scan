@@ -1,0 +1,47 @@
+name: scan
+
+on:
+  workflow_dispatch:
+
+env:
+  R2_ACCOUNT_ID: f1b5019a1d5ee73f9494a30464733335
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - run: sudo apt-get update && sudo apt-get install -y unar
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python scan.py --shard ${{ matrix.shard }} --shards 16
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out/shard-${{ matrix.shard }}.json
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - run: python merge.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: games
+          path: games.json
