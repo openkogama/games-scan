@@ -1,0 +1,44 @@
+name: findtypes
+
+on:
+  workflow_dispatch:
+    inputs:
+      types:
+        description: "World object types to find, comma separated"
+        default: "58,59"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python findtypes.py --shard ${{ matrix.shard }} --shards 16 --types "${{ inputs.types }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: findtypes-${{ matrix.shard }}
+          path: out/findtypes-${{ matrix.shard }}.json
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          path: shards
+          merge-multiple: true
+      - run: python findtypes.py --merge shards/*.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: findtypes
+          path: findtypes.json
