@@ -2,3 +2,4 @@ out/
 games.json
 *.db
 __pycache__/
+models.json
