@@ -5,6 +5,7 @@ on:
 
 env:
   R2_ACCOUNT_ID: f1b5019a1d5ee73f9494a30464733335
+  ATLAS: https://cdn.openkogama.org/eu/kogama_assets/v96/kogama_assets_u5/AssetBundles/Atlas/atlasmid.unity3d
 
 jobs:
   scan:
@@ -23,8 +24,12 @@ jobs:
         with:
           name: models-${{ matrix.shard }}
           path: out/models-${{ matrix.shard }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blobs-${{ matrix.shard }}
+          path: out/blobs-${{ matrix.shard }}
 
-  merge:
+  build:
     runs-on: ubuntu-latest
     needs: scan
     steps:
@@ -32,24 +37,36 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install boto3
+      - run: pip install boto3 Pillow UnityPy
       - uses: actions/download-artifact@v4
         with:
+          pattern: blobs-*
+          path: blobs
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: models-*
           path: shards
           merge-multiple: true
-      - run: python models.py --merge shards/*.json
+      - run: curl -sSfL -o atlasmid.unity3d "$ATLAS"
+      - run: python materials.py --atlas atlasmid.unity3d
       - env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python models.py --extract out/models
+        run: python models.py --pack blobs --build ${{ github.run_id }}
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python models.py --index shards/*.json --build ${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         with:
-          name: models
-          path: models.json
+          name: build
+          path: |
+            out/latest.json
+            out/top.json
 
   render:
     runs-on: ubuntu-latest
-    needs: merge
+    needs: build
     strategy:
       fail-fast: false
       matrix:
@@ -62,10 +79,30 @@ jobs:
       - run: pip install boto3 numpy Pillow UnityPy
       - uses: actions/download-artifact@v4
         with:
-          name: models
-      - run: curl -sSfL -o atlasmid.unity3d https://cdn.openkogama.org/eu/kogama_assets/v96/kogama_assets_u5/AssetBundles/Atlas/atlasmid.unity3d
+          name: build
+          path: out
+      - run: curl -sSfL -o atlasmid.unity3d "$ATLAS"
       - run: python materials.py --atlas atlasmid.unity3d
       - env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python render.py --catalog models.json --shard ${{ matrix.shard }} --shards 16 --upload
+        run: python render.py --catalog out/top.json --shard ${{ matrix.shard }} --shards 16 --upload
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build, render]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: out
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python models.py --publish

@@ -39,6 +39,7 @@ def main():
     width, height = atlas.size
     tile, margin, cell, columns = layout(width)
     os.makedirs(args.out, exist_ok=True)
+    atlas.convert("RGB").save(os.path.join(args.out, "atlas.png"), optimize=True)
 
     colors = {}
     for material in range(COUNT):

@@ -1,9 +1,12 @@
 import argparse
+import glob
 import hashlib
 import json
 import os
+import sqlite3
 import struct
 import sys
+import zlib
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,10 +19,21 @@ ONE_MATERIAL = 2
 IDENTITY = bytes([20, 120, 124, 24, 4, 104, 100, 0])
 SAMPLES = 5
 PRODUCT_SHAPES = 3
+MIN_CUBES = 8
+TOP_MAPS = 5
 MAGIC = b"OKM1"
 FORMAT = 2
+BUCKETS = 16
+PACKS = 4096
+PAGE_SIZE = 4096
+KEEP_BUILDS = 2
 PREFIX = "models/v2/"
 IMMUTABLE = "public, max-age=31536000, immutable"
+SHORT = "public, max-age=300"
+
+
+def build_prefix(build):
+    return f"{PREFIX}builds/{build}/"
 
 
 def unique_games():
@@ -132,7 +146,7 @@ def models_in(batches):
     for proto, (instances, items) in used.items():
         scale, author, data = prototypes[proto]
         cubes = cubes_of(data)
-        if not cubes:
+        if len(cubes) < MIN_CUBES:
             continue
         blob = model_blob(scale, cubes)
         sha = hashlib.sha256(blob).hexdigest()
@@ -172,6 +186,9 @@ def scan(shard, shards, limit):
         mine = mine[:limit]
     print(f"shard {shard}/{shards}: {len(mine)} of {len(games)}", flush=True)
 
+    folder = f"out/blobs-{shard}"
+    os.makedirs(folder, exist_ok=True)
+    buckets = [open(os.path.join(folder, f"{bucket:x}.bin"), "wb") for bucket in range(BUCKETS)]
     models, errors = {}, 0
     with ThreadPoolExecutor(8) as pool:
         results = pool.map(lambda index: (index, *read_game(games[index])), mine)
@@ -180,6 +197,8 @@ def scan(shard, shards, limit):
             for sha, model in found.items():
                 merged = models.get(sha)
                 if merged is None:
+                    packed = zlib.compress(model["blob"], 9)
+                    buckets[int(sha[0], 16)].write(bytes.fromhex(sha) + struct.pack(">I", len(packed)) + packed)
                     merged = models[sha] = {k: v for k, v in model.items() if k != "blob"} | {"games": [], "authors": Counter(), "items": Counter(), "instances": 0}
                 merged["games"].append(index)
                 merged["authors"].update(model["authors"])
@@ -187,18 +206,88 @@ def scan(shard, shards, limit):
                 merged["instances"] += model["instances"]
             if done % 200 == 0:
                 print(f"{done}/{len(mine)} maps, {len(models)} models", flush=True)
+    for bucket in buckets:
+        bucket.close()
 
-    os.makedirs("out", exist_ok=True)
     with open(f"out/models-{shard}.json", "w", encoding="utf-8") as f:
         json.dump({"maps": len(mine), "errors": errors, "models": models}, f, separators=(",", ":"))
     print(f"shard {shard}: {len(models)} models, {errors} errors")
 
 
-def merge(paths):
-    games = unique_games()
+def upload(s3, key, data, content_type, cache):
+    if s3:
+        s3.put_object(Bucket=BUCKET, Key=key, Body=data, ContentType=content_type, CacheControl=cache)
+
+
+def upload_file(s3, key, path, content_type, cache):
+    if s3:
+        s3.upload_file(path, BUCKET, key, ExtraArgs={"ContentType": content_type, "CacheControl": cache})
+
+
+def records(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    pos = 0
+    while pos < len(data):
+        size = struct.unpack(">I", data[pos + 32 : pos + 36])[0]
+        yield data[pos : pos + 32].hex(), data[pos + 36 : pos + 36 + size]
+        pos += 36 + size
+
+
+def pack(folder, build):
+    s3 = client()
+    target = build_prefix(build) + "packs/"
+    os.makedirs("out/packs", exist_ok=True)
+    per_bucket = PACKS // BUCKETS
+    total, written = 0, 0
+    with open("out/locations.tsv", "w", encoding="utf-8") as locations, ThreadPoolExecutor(16) as pool:
+        sent = []
+        for bucket in range(BUCKETS):
+            found = {}
+            for path in sorted(glob.glob(os.path.join(folder, "**", f"{bucket:x}.bin"), recursive=True)):
+                for sha, packed in records(path):
+                    found.setdefault(sha, packed)
+            grouped = defaultdict(list)
+            for sha in sorted(found):
+                grouped[int(sha[:3], 16)].append(sha)
+            for number in range(bucket * per_bucket, (bucket + 1) * per_bucket):
+                if number not in grouped:
+                    continue
+                body = bytearray()
+                for sha in grouped[number]:
+                    locations.write(f"{sha}\t{number}\t{len(body)}\t{len(found[sha])}\n")
+                    body += found[sha]
+                with open(f"out/packs/{number:03x}.bin", "wb") as f:
+                    f.write(body)
+                sent.append(pool.submit(upload, s3, f"{target}{number:03x}.bin", bytes(body), "application/octet-stream", IMMUTABLE))
+                written += len(body)
+            total += len(found)
+            print(f"bucket {bucket:x}: {len(found)} models", flush=True)
+        for future in sent:
+            future.result()
+    print(f"{total} models in {len(sent)} packs, {written // 1024 // 1024} MB")
+
+
+def repaired(text):
+    for _ in range(2):
+        fixed = None
+        for codec in ("cp1252", "latin-1"):
+            try:
+                fixed = text.encode(codec).decode("utf-8")
+                break
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+        if fixed is None or fixed == text:
+            break
+        text = fixed
+    return text
+
+
+def merged_stats(paths):
     models, maps, errors = {}, 0, 0
     for path in paths:
-        shard = json.load(open(path, encoding="utf-8"))
+        with open(path, encoding="utf-8") as f:
+            shard = json.load(f)
         maps += shard["maps"]
         errors += shard["errors"]
         for sha, m in shard["models"].items():
@@ -209,6 +298,50 @@ def merge(paths):
             merged["authors"].update({int(k): v for k, v in m["authors"].items()})
             merged["items"].update({int(k): v for k, v in m["items"].items()})
             merged["instances"] += m["instances"]
+        del shard
+    return models, maps, errors
+
+
+SCHEMA = """
+CREATE TABLE models (
+    id INTEGER PRIMARY KEY,
+    sha256 TEXT NOT NULL,
+    maps INTEGER NOT NULL,
+    instances INTEGER NOT NULL,
+    cubes INTEGER NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    depth INTEGER NOT NULL,
+    scale REAL NOT NULL,
+    deformed INTEGER NOT NULL,
+    materials TEXT NOT NULL,
+    image INTEGER NOT NULL,
+    pack INTEGER NOT NULL,
+    offset INTEGER NOT NULL,
+    length INTEGER NOT NULL
+);
+CREATE TABLE maps (id INTEGER PRIMARY KEY, site TEXT NOT NULL, game TEXT NOT NULL, name TEXT NOT NULL);
+CREATE TABLE model_maps (model INTEGER NOT NULL, map INTEGER NOT NULL, PRIMARY KEY (model, map)) WITHOUT ROWID;
+CREATE TABLE model_authors (model INTEGER NOT NULL, author INTEGER NOT NULL, PRIMARY KEY (model, author)) WITHOUT ROWID;
+CREATE TABLE model_items (model INTEGER NOT NULL, item INTEGER NOT NULL, PRIMARY KEY (model, item)) WITHOUT ROWID;
+CREATE VIRTUAL TABLE map_search USING fts5(name, content='maps', content_rowid='id');
+"""
+
+INDEXES = """
+CREATE UNIQUE INDEX models_sha ON models(sha256);
+CREATE INDEX models_scale ON models(scale, id);
+CREATE INDEX model_maps_map ON model_maps(map, model);
+CREATE INDEX model_authors_author ON model_authors(author, model);
+CREATE INDEX model_items_item ON model_items(item, model);
+INSERT INTO map_search(map_search) VALUES ('rebuild');
+"""
+
+
+def index(paths, build):
+    games = unique_games()
+    models, maps, errors = merged_stats(paths)
+    with open("out/locations.tsv", encoding="utf-8") as f:
+        locations = {sha: (int(number), int(offset), int(length)) for sha, number, offset, length in (line.split("\t") for line in f)}
 
     shapes = defaultdict(set)
     for sha, m in models.items():
@@ -216,81 +349,88 @@ def merge(paths):
             shapes[item].add(sha)
     products = {item for item, shas in shapes.items() if len(shas) <= PRODUCT_SHAPES}
 
-    catalog, wanted = [], {}
-    for sha, m in models.items():
+    order = sorted((sha for sha in models if sha in locations),
+                   key=lambda sha: (len(set(models[sha]["games"])), models[sha]["instances"]), reverse=True)
+    if os.path.exists("out/models.db"):
+        os.remove("out/models.db")
+    db = sqlite3.connect("out/models.db")
+    db.execute(f"PRAGMA page_size = {PAGE_SIZE}")
+    db.execute("PRAGMA journal_mode = DELETE")
+    db.executescript(SCHEMA)
+
+    top, used_games = [], set()
+    rows, links, authors, items = [], [], [], []
+    for rank, sha in enumerate(order, 1):
+        m = models[sha]
         map_count = len(set(m["games"]))
-        items = [i for i, _ in m["items"].most_common() if i in products]
-        if map_count < 2:
-            continue
-        wanted[sha] = m["games"][0]
-        catalog.append({
-            "sha256": sha,
-            "maps": map_count,
-            "instances": m["instances"],
-            "cubes": m["cubes"],
-            "size": m["size"],
-            "scale": m["scale"],
-            "deformed": m["deformed"],
-            "materials": m["materials"],
-            "items": items[:5],
-            "authors": [a for a, _ in m["authors"].most_common(5)],
-            "samples": [{"id": games[g].get("id"), "site": games[g].get("site"), "name": games[g].get("name")} for g in m["games"][:SAMPLES]],
-        })
-    catalog.sort(key=lambda m: (m["maps"], m["instances"]), reverse=True)
+        number, offset, length = locations[sha]
+        image = map_count >= TOP_MAPS
+        rows.append((rank, sha, map_count, m["instances"], m["cubes"], *m["size"], m["scale"], m["deformed"],
+                     ",".join(str(x) for x in m["materials"]), int(image), number, offset, length))
+        samples = list(dict.fromkeys(m["games"]))[:SAMPLES]
+        used_games.update(samples)
+        links.extend((rank, game + 1) for game in samples)
+        authors.extend((rank, author) for author, _ in m["authors"].most_common(SAMPLES))
+        items.extend((rank, item) for item, _ in m["items"].most_common() if item in products)
+        if image:
+            top.append({"sha256": sha, "pack": number, "offset": offset, "length": length})
+    db.executemany("INSERT INTO models VALUES (" + ",".join("?" * 15) + ")", rows)
+    db.executemany("INSERT INTO maps VALUES (?, ?, ?, ?)",
+                   [(game + 1, games[game].get("site") or "", games[game].get("id") or "", repaired(games[game].get("name") or "")) for game in sorted(used_games)])
+    db.executemany("INSERT INTO model_maps VALUES (?, ?)", links)
+    db.executemany("INSERT INTO model_authors VALUES (?, ?)", authors)
+    db.executemany("INSERT INTO model_items VALUES (?, ?)", items)
+    db.executescript(INDEXES)
+    db.commit()
+    db.execute("ANALYZE")
+    db.execute("VACUUM")
+    db.close()
 
-    with open("models.json", "w", encoding="utf-8") as f:
-        json.dump({"format": FORMAT, "maps": maps, "errors": errors, "scanned": len(models), "models": catalog}, f, ensure_ascii=False)
-    with open("out/wanted.json", "w", encoding="utf-8") as f:
-        json.dump(wanted, f)
-
-    shared = sum(1 for m in catalog if m["maps"] > 1)
-    priced = sum(1 for m in catalog if m["items"])
-    print(f"{maps} maps, {errors} errors, {len(models)} models seen, {len(catalog)} kept: {shared} in more than one map, {priced} with a product item")
-    for m in catalog[:15]:
-        print(m["maps"], m["instances"], m["cubes"], m["size"], m["items"][:2], m["sha256"][:12], m["samples"][0]["name"] if m["samples"] else "")
-
-
-def upload(s3, key, data, content_type, cache):
-    if s3:
-        s3.put_object(Bucket=BUCKET, Key=key, Body=data, ContentType=content_type, CacheControl=cache)
-
-
-def stored(s3, key):
-    try:
-        s3.head_object(Bucket=BUCKET, Key=key)
-        return True
-    except Exception:
-        return False
-
-
-def extract(target):
     s3 = client()
-    games = unique_games()
-    wanted = json.load(open("out/wanted.json", encoding="utf-8"))
-    os.makedirs(target, exist_ok=True)
-    missing = {sha: game for sha, game in wanted.items()
-               if not os.path.exists(os.path.join(target, sha + ".bin")) and not (s3 and stored(s3, PREFIX + sha + ".bin"))}
-    by_game = defaultdict(set)
-    for sha, game in missing.items():
-        by_game[game].add(sha)
-    print(f"{len(missing)} models from {len(by_game)} maps", flush=True)
+    base = build_prefix(build)
+    upload_file(s3, base + "models.db", "out/models.db", "application/octet-stream", IMMUTABLE)
+    materials = {}
+    if os.path.exists("out/materials/materials.json"):
+        with open("out/materials/materials.json", encoding="utf-8") as f:
+            materials = json.load(f)
+        upload_file(s3, base + "atlas.png", "out/materials/atlas.png", "image/png", IMMUTABLE)
 
-    def pull(game):
-        found, error = read_game(games[game])
-        written = 0
-        for sha in by_game[game]:
-            if sha in found:
-                with open(os.path.join(target, sha + ".bin"), "wb") as f:
-                    f.write(found[sha]["blob"])
-                upload(s3, PREFIX + sha + ".bin", found[sha]["blob"], "application/octet-stream", IMMUTABLE)
-                written += 1
-        return written, error
+    latest = {
+        "format": FORMAT,
+        "build": build,
+        "maps": maps,
+        "errors": errors,
+        "models": len(order),
+        "images": len(top),
+        "packs": PACKS,
+        "database": {"path": "models.db", "bytes": os.path.getsize("out/models.db"), "pageSize": PAGE_SIZE},
+        "materials": {key: value for key, value in materials.items() if key != "colors"},
+    }
+    with open("out/latest.json", "w", encoding="utf-8") as f:
+        json.dump(latest, f)
+    with open("out/top.json", "w", encoding="utf-8") as f:
+        json.dump({"build": build, "models": top}, f)
+    print(f"{maps} maps, {errors} errors, {len(order)} models, {len(top)} with images, database {latest['database']['bytes'] // 1024 // 1024} MB")
 
-    with ThreadPoolExecutor(8) as pool:
-        results = list(pool.map(pull, by_game))
-    print(f"{sum(w for w, _ in results)} written, {sum(1 for _, e in results if e)} map errors")
-    with open("models.json", "rb") as f:
-        upload(s3, PREFIX + "index.json", f.read(), "application/json", "public, max-age=3600")
+
+def publish():
+    s3 = client()
+    with open("out/latest.json", "rb") as f:
+        upload(s3, PREFIX + "latest.json", f.read(), "application/json", SHORT)
+    if not s3:
+        return
+    builds = defaultdict(lambda: [None, []])
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=PREFIX + "builds/"):
+        for item in page.get("Contents", []):
+            build = item["Key"][len(PREFIX + "builds/") :].split("/")[0]
+            entry = builds[build]
+            entry[0] = max(entry[0], item["LastModified"]) if entry[0] else item["LastModified"]
+            entry[1].append(item["Key"])
+    old = sorted(builds, key=lambda build: builds[build][0], reverse=True)[KEEP_BUILDS:]
+    keys = [key for build in old for key in builds[build][1]]
+    for start in range(0, len(keys), 1000):
+        s3.delete_objects(Bucket=BUCKET, Delete={"Objects": [{"Key": key} for key in keys[start : start + 1000]]})
+    print(f"published, removed {len(old)} old builds")
 
 
 if __name__ == "__main__":
@@ -299,12 +439,16 @@ if __name__ == "__main__":
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--shards", type=int, default=1)
     p.add_argument("--limit", type=int, default=0)
-    p.add_argument("--merge", nargs="*")
-    p.add_argument("--extract", default="")
+    p.add_argument("--build", default="local")
+    p.add_argument("--pack", default="")
+    p.add_argument("--index", nargs="*")
+    p.add_argument("--publish", action="store_true")
     args = p.parse_args()
-    if args.merge is not None:
-        merge(args.merge)
-    elif args.extract:
-        extract(args.extract)
+    if args.pack:
+        pack(args.pack, args.build)
+    elif args.index is not None:
+        index(args.index, args.build)
+    elif args.publish:
+        publish()
     else:
         scan(args.shard, args.shards, args.limit)

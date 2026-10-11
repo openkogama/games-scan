@@ -2,17 +2,17 @@ import argparse
 import json
 import math
 import os
+import urllib.request
+import zlib
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image
 
-from datahash import get
-from models import IDENTITY, PREFIX, cubes_of, split_blob, upload
+from models import IDENTITY, IMMUTABLE, build_prefix, cubes_of, split_blob, upload
 from scan import client
 
 CDN = "https://cdn.openkogama.org/"
-IMAGE_CACHE = "public, max-age=86400"
 
 SIZE = 256
 SUPERSAMPLE = 2
@@ -238,12 +238,30 @@ def render_file(job):
         return f"error {e}"
 
 
-def fetch(sha, folder):
-    path = os.path.join(folder, sha + ".bin")
+def packed_model(build, entry):
+    local = f"out/packs/{entry['pack']:03x}.bin"
+    if os.path.exists(local):
+        with open(local, "rb") as f:
+            f.seek(entry["offset"])
+            return f.read(entry["length"])
+    end = entry["offset"] + entry["length"] - 1
+    url = f"{CDN}{build_prefix(build)}packs/{entry['pack']:03x}.bin"
+    request = urllib.request.Request(url, headers={"User-Agent": "games-scan", "Range": f"bytes={entry['offset']}-{end}"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.read()
+        except Exception as e:
+            error = e
+    raise RuntimeError(error)
+
+
+def fetch(build, entry, folder):
+    path = os.path.join(folder, entry["sha256"] + ".bin")
     if os.path.exists(path):
         return True
     try:
-        data = get(CDN + PREFIX + sha + ".bin")
+        data = zlib.decompress(packed_model(build, entry))
     except Exception:
         return False
     with open(path, "wb") as f:
@@ -259,7 +277,7 @@ def main():
     p.add_argument("--size", type=int, default=SIZE)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--workers", type=int, default=os.cpu_count() or 4)
-    p.add_argument("--catalog", default="", help="models.json, renders its models instead of every file in --models")
+    p.add_argument("--catalog", default="", help="top.json from models.py --index, renders its models instead of every file in --models")
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--shards", type=int, default=1)
     p.add_argument("--upload", action="store_true")
@@ -267,14 +285,18 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     os.makedirs(args.models, exist_ok=True)
+    build = None
     if args.catalog:
-        shas = [m["sha256"] for m in json.load(open(args.catalog, encoding="utf-8"))["models"]][args.shard :: args.shards]
+        with open(args.catalog, encoding="utf-8") as f:
+            catalog = json.load(f)
+        build = catalog["build"]
+        entries = catalog["models"][args.shard :: args.shards]
         if args.limit:
-            shas = shas[: args.limit]
+            entries = entries[: args.limit]
         with ThreadPoolExecutor(16) as pool:
-            fetched = list(pool.map(lambda sha: fetch(sha, args.models), shas))
-        names = [sha + ".bin" for sha, ok in zip(shas, fetched) if ok]
-        print(f"shard {args.shard}/{args.shards}: {len(names)} of {len(shas)} models fetched", flush=True)
+            fetched = list(pool.map(lambda entry: fetch(build, entry, args.models), entries))
+        names = [entry["sha256"] + ".bin" for entry, ok in zip(entries, fetched) if ok]
+        print(f"shard {args.shard}/{args.shards}: {len(names)} of {len(entries)} models fetched", flush=True)
     else:
         names = sorted(n for n in os.listdir(args.models) if n.endswith(".bin"))
     jobs = [(os.path.join(args.models, n), os.path.join(args.out, n[:-4] + ".png"), args.materials, args.size)
@@ -288,13 +310,13 @@ def main():
             results[key] = results.get(key, 0) + 1
     print(f"{len(jobs)} models: {results}", flush=True)
 
-    if args.upload:
+    if args.upload and build:
         s3 = client()
         images = [n[:-4] + ".png" for n in names if os.path.exists(os.path.join(args.out, n[:-4] + ".png"))]
 
         def send(name):
             with open(os.path.join(args.out, name), "rb") as f:
-                upload(s3, PREFIX + name, f.read(), "image/png", IMAGE_CACHE)
+                upload(s3, build_prefix(build) + "images/" + name, f.read(), "image/png", IMMUTABLE)
 
         with ThreadPoolExecutor(16) as pool:
             list(pool.map(send, images))
