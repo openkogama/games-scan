@@ -414,7 +414,7 @@ def index(paths, build):
 
     s3 = client()
     base = build_prefix(build)
-    upload_file(s3, base + "models.db", "out/models.db", "application/octet-stream", IMMUTABLE)
+    upload_file(s3, base + "database.bin", "out/models.db", "application/octet-stream", IMMUTABLE)
     upload_file(s3, base + "cards.bin", "out/cards.bin", "application/octet-stream", IMMUTABLE)
     upload_file(s3, base + "maps.json", "out/maps.json", "application/json; charset=utf-8", IMMUTABLE)
     materials = {}
@@ -431,7 +431,7 @@ def index(paths, build):
         "models": len(order),
         "images": len(top),
         "packs": PACKS,
-        "database": {"path": "models.db", "bytes": os.path.getsize("out/models.db"), "pageSize": PAGE_SIZE},
+        "database": {"path": "database.bin", "bytes": os.path.getsize("out/models.db"), "pageSize": PAGE_SIZE},
         "cards": {"path": "cards.bin", "record": CARD.size},
         "titles": "maps.json",
         "materials": {key: value for key, value in materials.items() if key != "colors"},
