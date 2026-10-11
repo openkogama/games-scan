@@ -384,8 +384,10 @@ def index(paths, build):
                      ",".join(str(x) for x in m["materials"]), int(image), number, offset, length))
         samples = list(dict.fromkeys(m["games"]))[:SAMPLES]
         used_games.update(samples)
-        first_games.update(samples[:1])
-        cards += CARD.pack(bytes.fromhex(sha), map_count, m["cubes"], m["scale"], int(image), number, offset, length, samples[0] + 1 if samples else 0)
+        titled = next((game for game in samples if name(game)), samples[0] if samples else None)
+        if titled is not None:
+            first_games.add(titled)
+        cards += CARD.pack(bytes.fromhex(sha), map_count, m["cubes"], m["scale"], int(image), number, offset, length, 0 if titled is None else titled + 1)
         words.append((rank, " ".join([name(game) for game in samples] + [scale_word(m["scale"])])))
         links.extend((rank, game + 1) for game in samples)
         authors.extend((rank, author) for author, _ in m["authors"].most_common(SAMPLES))
