@@ -16,7 +16,9 @@ ONE_MATERIAL = 2
 IDENTITY = bytes([20, 120, 124, 24, 4, 104, 100, 0])
 SAMPLES = 5
 PRODUCT_SHAPES = 3
-PREFIX = "models/"
+MAGIC = b"OKM1"
+FORMAT = 2
+PREFIX = "models/v2/"
 IMMUTABLE = "public, max-age=31536000, immutable"
 
 
@@ -105,6 +107,16 @@ def canonical(cubes):
     return bytes(out)
 
 
+def model_blob(scale, cubes):
+    return MAGIC + struct.pack(">f", scale) + canonical(cubes)
+
+
+def split_blob(blob):
+    if blob[:4] != MAGIC:
+        return 1.0, blob
+    return struct.unpack(">f", blob[4:8])[0], blob[8:]
+
+
 def models_in(batches):
     prototypes, objects = prototypes_and_models(batches)
     skipped = under_avatar(objects)
@@ -122,7 +134,7 @@ def models_in(batches):
         cubes = cubes_of(data)
         if not cubes:
             continue
-        blob = canonical(cubes)
+        blob = model_blob(scale, cubes)
         sha = hashlib.sha256(blob).hexdigest()
         if sha not in found:
             xs, ys, zs = zip(*cubes)
@@ -227,7 +239,7 @@ def merge(paths):
     catalog.sort(key=lambda m: (m["maps"], m["instances"]), reverse=True)
 
     with open("models.json", "w", encoding="utf-8") as f:
-        json.dump({"maps": maps, "errors": errors, "scanned": len(models), "models": catalog}, f, ensure_ascii=False)
+        json.dump({"format": FORMAT, "maps": maps, "errors": errors, "scanned": len(models), "models": catalog}, f, ensure_ascii=False)
     with open("out/wanted.json", "w", encoding="utf-8") as f:
         json.dump(wanted, f)
 

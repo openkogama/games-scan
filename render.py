@@ -1,21 +1,30 @@
 import argparse
+import json
 import math
 import os
-import struct
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image
 
-from models import IDENTITY
+from datahash import get
+from models import IDENTITY, PREFIX, cubes_of, split_blob, upload
+from scan import client
+
+CDN = "https://cdn.openkogama.org/"
+IMAGE_CACHE = "public, max-age=86400"
 
 SIZE = 256
 SUPERSAMPLE = 2
-MARGIN = 0.08
-YAW = math.radians(45)
-PITCH = math.radians(30)
-LIGHT = np.array([-0.4, 0.8, -0.45])
-AMBIENT = 0.55
+FIELD_OF_VIEW = 35.0
+CAMERA_OFFSET = np.array([4.57, 2.0, 0.15])
+PREVIEW_SIZE = 2.0
+TURN = -45.0
+LIGHT_EULER = (50.0, -30.0)
+LIGHT_COLOR = np.array([1.0, 0.988, 0.753])
+AMBIENT = 0.45
+OCCLUSION = 0.5
+NEAR = 0.05
 MAX_TRIANGLES = 200_000
 
 FACES = [
@@ -26,35 +35,14 @@ FACES = [
     ([4, 7, 0, 3], (-1, 0, 0), 16, 32),
     ([6, 5, 2, 1], (1, 0, 0), 32, 16),
 ]
-FACE_UV = np.array([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]])
+FACE_UV = [(0, 1, 2, 0.5), (0, -1, 2, -0.5), (0, 1, 1, 0.5), (0, -1, 1, -0.5), (2, -1, 1, -0.5), (2, 1, 1, 0.5)]
 
 
 def corner(value):
     return (-0.5 + value // 25 * 0.25, -0.5 + value // 5 % 5 * 0.25, -0.5 + value % 5 * 0.25)
 
 
-def read_model(data):
-    cubes = {}
-    count = struct.unpack(">i", data[:4])[0]
-    pos = 4
-    for _ in range(count):
-        x, y, z = struct.unpack(">hhh", data[pos : pos + 6])
-        flags = data[pos + 6]
-        pos += 7
-        if flags & 1:
-            corners = IDENTITY
-        else:
-            corners = data[pos : pos + 8]
-            pos += 8
-        if flags & 2:
-            materials = bytes([data[pos]]) * 6
-            pos += 1
-        else:
-            materials = data[pos : pos + 6]
-            pos += 6
-        for step in range(max(flags >> 2, 1)):
-            cubes[(x + step, y, z)] = (bytes(corners), bytes(materials))
-    return cubes
+IDENTITY_CORNERS = [corner(c) for c in IDENTITY]
 
 
 def unindented(corners):
@@ -71,120 +59,177 @@ def unindented(corners):
     return sides
 
 
-def triangles(cubes):
+def face_uv(face, point, scale):
+    axis_u, sign_u, axis_v, offset_u = FACE_UV[face]
+    return ((sign_u * point[axis_u] + offset_u) * scale * 0.5, (point[axis_v] + 0.5) * scale * 0.5)
+
+
+def occlusion(cubes, cube, normal, canonical):
+    axis = next(i for i in range(3) if normal[i])
+    base = tuple(c + n for c, n in zip(cube, normal))
+    tangents = [i for i in range(3) if i != axis]
+    steps = []
+    for i in tangents:
+        step = [0, 0, 0]
+        step[i] = 1 if canonical[i] > 0 else -1
+        steps.append(step)
+    cells = [base, tuple(b + s for b, s in zip(base, steps[0])), tuple(b + s for b, s in zip(base, steps[1])),
+             tuple(b + s + t for b, s, t in zip(base, steps[0], steps[1]))]
+    return sum(1 for cell in cells if cell not in cubes) * 0.25
+
+
+def triangles(cubes, scale, count, fallback):
     flags = {pos: unindented(corners) for pos, (corners, _) in cubes.items()}
-    points, uvs, materials = [], [], []
-    for (x, y, z), (corners, faces) in cubes.items():
-        verts = [tuple(a + b for a, b in zip(corner(c), (x, y, z))) for c in corners]
-        for face, (indices, (dx, dy, dz), own, opposite) in enumerate(FACES):
-            neighbor = (x + dx, y + dy, z + dz)
-            if neighbor in cubes and flags[(x, y, z)] & own and flags[neighbor] & opposite:
+    points, uvs, lights, materials, normals = [], [], [], [], []
+    for cube, (corners, faces) in cubes.items():
+        verts = [tuple(a + b for a, b in zip(corner(c), cube)) for c in corners]
+        for face, (indices, normal, own, opposite) in enumerate(FACES):
+            neighbor = tuple(c + n for c, n in zip(cube, normal))
+            if neighbor in cubes and flags[cube] & own and flags[neighbor] & opposite:
                 continue
             quad = [verts[i] for i in indices]
+            quad_uv = [face_uv(face, p, scale) for p in quad]
+            quad_light = [occlusion(cubes, cube, normal, IDENTITY_CORNERS[i]) for i in indices]
+            material = faces[face] if faces[face] < count else fallback
             for a, b, c in ((0, 3, 2), (2, 1, 0)):
                 points.append((quad[a], quad[b], quad[c]))
-                uvs.append((FACE_UV[a], FACE_UV[b], FACE_UV[c]))
-                materials.append(faces[face])
-    return np.array(points, dtype=np.float64), np.array(uvs, dtype=np.float64), np.array(materials, dtype=np.int32)
+                uvs.append((quad_uv[a], quad_uv[b], quad_uv[c]))
+                lights.append((quad_light[a], quad_light[b], quad_light[c]))
+                materials.append(material)
+                normals.append(normal)
+    return (np.array(points, dtype=np.float64), np.array(uvs, dtype=np.float64), np.array(lights, dtype=np.float64),
+            np.array(materials, dtype=np.int32), np.array(normals, dtype=np.float64))
 
 
-def view_matrix():
-    cy, sy = math.cos(YAW), math.sin(YAW)
-    cp, sp = math.cos(PITCH), math.sin(PITCH)
-    yaw = np.array([[cy, 0, -sy], [0, 1, 0], [sy, 0, cy]])
-    pitch = np.array([[1, 0, 0], [0, cp, sp], [0, -sp, cp]])
-    return pitch @ yaw
+def yaw(degrees):
+    t = math.radians(degrees)
+    return np.array([[math.cos(t), 0, math.sin(t)], [0, 1, 0], [-math.sin(t), 0, math.cos(t)]])
 
 
-def render(data, tiles, size=SIZE):
-    cubes = read_model(data)
-    tris, uvs, mats = triangles(cubes)
+def pitch(degrees):
+    t = math.radians(degrees)
+    return np.array([[1, 0, 0], [0, math.cos(t), -math.sin(t)], [0, math.sin(t), math.cos(t)]])
+
+
+def light_direction():
+    forward = yaw(LIGHT_EULER[1]) @ pitch(LIGHT_EULER[0]) @ np.array([0.0, 0.0, 1.0])
+    return -forward / np.linalg.norm(forward)
+
+
+def sample(tile, u, v):
+    size = tile.shape[0]
+    x = (u - np.floor(u)) * size - 0.5
+    y = (1 - (v - np.floor(v))) * size - 0.5
+    x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
+    fx, fy = (x - x0)[:, None], (y - y0)[:, None]
+    x0, y0 = x0 % size, y0 % size
+    x1, y1 = (x0 + 1) % size, (y0 + 1) % size
+    top = tile[y0, x0] * (1 - fx) + tile[y0, x1] * fx
+    bottom = tile[y1, x0] * (1 - fx) + tile[y1, x1] * fx
+    return top * (1 - fy) + bottom * fy
+
+
+def render(data, materials, size=SIZE):
+    tiles, emission, fallback = materials
+    scale, cube_data = split_blob(data)
+    cubes = cubes_of(cube_data)
+    tris, uvs, lights, mats, face_normals = triangles(cubes, scale, len(tiles), fallback)
     if len(tris) == 0 or len(tris) > MAX_TRIANGLES:
         return None
 
-    view = view_matrix()
-    world_normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
-    lengths = np.linalg.norm(world_normals, axis=1)
-    keep = lengths > 1e-9
-    tris, uvs, mats, world_normals, lengths = tris[keep], uvs[keep], mats[keep], world_normals[keep], lengths[keep]
-    world_normals /= lengths[:, None]
-    projected = tris @ view.T
-    facing = (world_normals @ view.T)[:, 2] < 0
-    tris, uvs, mats, world_normals, projected = tris[facing], uvs[facing], mats[facing], world_normals[facing], projected[facing]
-    if len(projected) == 0:
+    flat = tris.reshape(-1, 3)
+    low, high = flat.min(axis=0), flat.max(axis=0)
+    rotation = yaw(TURN)
+    tris = ((tris - (low + high) / 2) * (PREVIEW_SIZE / max(high - low))) @ rotation.T
+
+    normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    lengths = np.linalg.norm(normals, axis=1)
+    keep = lengths > 1e-12
+    tris, uvs, lights, mats, normals, face_normals = tris[keep], uvs[keep], lights[keep], mats[keep], normals[keep], face_normals[keep]
+    normals /= lengths[keep][:, None]
+    normals[np.einsum("ij,ij->i", normals, face_normals @ rotation.T) < 0] *= -1
+
+    eye = CAMERA_OFFSET
+    forward = -eye / np.linalg.norm(eye)
+    right = np.cross([0.0, 1.0, 0.0], forward)
+    right /= np.linalg.norm(right)
+    up = np.cross(forward, right)
+    facing = np.einsum("ij,ij->i", normals, eye - tris.mean(axis=1)) > 0
+    tris, uvs, lights, mats, normals = tris[facing], uvs[facing], lights[facing], mats[facing], normals[facing]
+    if len(tris) == 0:
         return None
 
-    light = LIGHT / np.linalg.norm(LIGHT)
-    shade = AMBIENT + (1 - AMBIENT) * np.clip(world_normals @ light, 0, 1)
-
     full = size * SUPERSAMPLE
-    flat = projected.reshape(-1, 3)
-    low, high = flat[:, :2].min(axis=0), flat[:, :2].max(axis=0)
-    scale = full * (1 - 2 * MARGIN) / max(high[0] - low[0], high[1] - low[1], 1e-6)
-    center = (low + high) / 2
-    screen = np.empty_like(projected)
-    screen[..., 0] = (projected[..., 0] - center[0]) * scale + full / 2
-    screen[..., 1] = full / 2 - (projected[..., 1] - center[1]) * scale
-    screen[..., 2] = projected[..., 2]
+    focal = full / 2 / math.tan(math.radians(FIELD_OF_VIEW) / 2)
+    relative = tris - eye
+    depth_of = relative @ forward
+    if (depth_of <= NEAR).any():
+        return None
+    screen_x = full / 2 + (relative @ right) / depth_of * focal
+    screen_y = full / 2 - (relative @ up) / depth_of * focal
+
+    diffuse = np.clip(normals @ light_direction(), 0, 1)
+    lit = AMBIENT + diffuse[:, None] * LIGHT_COLOR
 
     color = np.zeros((full, full, 4), dtype=np.float32)
-    depth = np.full((full, full), np.inf, dtype=np.float64)
-    for (a, b, c), (ua, ub, uc), material, light_amount in zip(screen, uvs, mats, shade):
-        x0 = max(int(math.floor(min(a[0], b[0], c[0]))), 0)
-        x1 = min(int(math.ceil(max(a[0], b[0], c[0]))), full - 1)
-        y0 = max(int(math.floor(min(a[1], b[1], c[1]))), 0)
-        y1 = min(int(math.ceil(max(a[1], b[1], c[1]))), full - 1)
+    depth = np.full((full, full), np.inf)
+    for t in range(len(tris)):
+        (ax, bx, cx), (ay, by, cy), (za, zb, zc) = screen_x[t], screen_y[t], depth_of[t]
+        x0, x1 = max(int(math.floor(min(ax, bx, cx))), 0), min(int(math.ceil(max(ax, bx, cx))), full - 1)
+        y0, y1 = max(int(math.floor(min(ay, by, cy))), 0), min(int(math.ceil(max(ay, by, cy))), full - 1)
         if x1 < x0 or y1 < y0:
             continue
-        area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
         if abs(area) < 1e-12:
             continue
         xs, ys = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
-        w0 = ((b[0] - xs) * (c[1] - ys) - (b[1] - ys) * (c[0] - xs)) / area
-        w1 = ((c[0] - xs) * (a[1] - ys) - (c[1] - ys) * (a[0] - xs)) / area
+        w0 = ((bx - xs) * (cy - ys) - (by - ys) * (cx - xs)) / area
+        w1 = ((cx - xs) * (ay - ys) - (cy - ys) * (ax - xs)) / area
         w2 = 1 - w0 - w1
         inside = (w0 >= -1e-6) & (w1 >= -1e-6) & (w2 >= -1e-6)
         if not inside.any():
             continue
-        z = w0 * a[2] + w1 * b[2] + w2 * c[2]
+        inverse = w0 / za + w1 / zb + w2 / zc
+        z = 1 / inverse
         region = depth[y0 : y1 + 1, x0 : x1 + 1]
         closer = inside & (z < region)
         if not closer.any():
             continue
         region[closer] = z[closer]
-        tile = tiles[material if material < len(tiles) else 0]
-        th, tw = tile.shape[:2]
-        u = (w0 * ua[0] + w1 * ub[0] + w2 * uc[0])[closer]
-        v = (w0 * ua[1] + w1 * ub[1] + w2 * uc[1])[closer]
-        texels = tile[np.clip((v * th).astype(int), 0, th - 1), np.clip((u * tw).astype(int), 0, tw - 1)]
+        p0, p1, p2 = (w0 / za * z)[closer], (w1 / zb * z)[closer], (w2 / zc * z)[closer]
+        u = p0 * uvs[t, 0, 0] + p1 * uvs[t, 1, 0] + p2 * uvs[t, 2, 0]
+        v = p0 * uvs[t, 0, 1] + p1 * uvs[t, 1, 1] + p2 * uvs[t, 2, 1]
+        light = p0 * lights[t, 0] + p1 * lights[t, 1] + p2 * lights[t, 2]
+        texels = sample(tiles[mats[t]], u, v)
+        shade = lit[t] * (OCCLUSION + (1 - OCCLUSION) * light)[:, None] + emission[mats[t]]
         pixels = color[y0 : y1 + 1, x0 : x1 + 1]
-        pixels[closer, :3] = texels[:, :3] * light_amount
+        pixels[closer, :3] = texels[:, :3] * shade
         pixels[closer, 3] = 255
 
     image = Image.fromarray(np.clip(color, 0, 255).astype(np.uint8), "RGBA")
-    return image.resize((size, size), Image.LANCZOS)
+    return image.convert("RGBa").resize((size, size), Image.LANCZOS).convert("RGBA")
 
 
-def load_tiles(folder):
-    tiles = []
-    index = 0
-    while os.path.exists(os.path.join(folder, f"{index}.png")):
-        tiles.append(np.asarray(Image.open(os.path.join(folder, f"{index}.png")).convert("RGBA"), dtype=np.float32))
-        index += 1
-    return tiles
+def load_materials(folder):
+    info = json.load(open(os.path.join(folder, "materials.json"), encoding="utf-8"))
+    tiles = [np.asarray(Image.open(os.path.join(folder, f"{i}.png")).convert("RGBA"), dtype=np.float32) for i in range(info["count"])]
+    emission = np.zeros(info["count"])
+    for material, strength in info["emission"].items():
+        emission[int(material)] = strength
+    return tiles, emission, info["fallback"]
 
 
-_tiles = None
+_materials = None
 
 
 def render_file(job):
-    global _tiles
-    source, target, materials = job
-    if _tiles is None:
-        _tiles = load_tiles(materials)
+    global _materials
+    source, target, folder, size = job
+    if _materials is None:
+        _materials = load_materials(folder)
     try:
         with open(source, "rb") as f:
-            image = render(f.read(), _tiles)
+            image = render(f.read(), _materials, size)
         if image is None:
             return "skipped"
         image.save(target, optimize=True)
@@ -193,18 +238,46 @@ def render_file(job):
         return f"error {e}"
 
 
+def fetch(sha, folder):
+    path = os.path.join(folder, sha + ".bin")
+    if os.path.exists(path):
+        return True
+    try:
+        data = get(CDN + PREFIX + sha + ".bin")
+    except Exception:
+        return False
+    with open(path, "wb") as f:
+        f.write(data)
+    return True
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--models", default="out/models")
     p.add_argument("--materials", default="out/materials")
     p.add_argument("--out", default="out/images")
+    p.add_argument("--size", type=int, default=SIZE)
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--workers", type=int, default=os.cpu_count() or 4)
+    p.add_argument("--catalog", default="", help="models.json, renders its models instead of every file in --models")
+    p.add_argument("--shard", type=int, default=0)
+    p.add_argument("--shards", type=int, default=1)
+    p.add_argument("--upload", action="store_true")
     args = p.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    names = sorted(n for n in os.listdir(args.models) if n.endswith(".bin"))
-    jobs = [(os.path.join(args.models, n), os.path.join(args.out, n[:-4] + ".png"), args.materials)
+    os.makedirs(args.models, exist_ok=True)
+    if args.catalog:
+        shas = [m["sha256"] for m in json.load(open(args.catalog, encoding="utf-8"))["models"]][args.shard :: args.shards]
+        if args.limit:
+            shas = shas[: args.limit]
+        with ThreadPoolExecutor(16) as pool:
+            fetched = list(pool.map(lambda sha: fetch(sha, args.models), shas))
+        names = [sha + ".bin" for sha, ok in zip(shas, fetched) if ok]
+        print(f"shard {args.shard}/{args.shards}: {len(names)} of {len(shas)} models fetched", flush=True)
+    else:
+        names = sorted(n for n in os.listdir(args.models) if n.endswith(".bin"))
+    jobs = [(os.path.join(args.models, n), os.path.join(args.out, n[:-4] + ".png"), args.materials, args.size)
             for n in names if not os.path.exists(os.path.join(args.out, n[:-4] + ".png"))]
     if args.limit:
         jobs = jobs[: args.limit]
@@ -213,7 +286,19 @@ def main():
         for result in pool.map(render_file, jobs, chunksize=4):
             key = result.split(" ")[0]
             results[key] = results.get(key, 0) + 1
-    print(f"{len(jobs)} models: {results}")
+    print(f"{len(jobs)} models: {results}", flush=True)
+
+    if args.upload:
+        s3 = client()
+        images = [n[:-4] + ".png" for n in names if os.path.exists(os.path.join(args.out, n[:-4] + ".png"))]
+
+        def send(name):
+            with open(os.path.join(args.out, name), "rb") as f:
+                upload(s3, PREFIX + name, f.read(), "image/png", IMAGE_CACHE)
+
+        with ThreadPoolExecutor(16) as pool:
+            list(pool.map(send, images))
+        print(f"{len(images)} images uploaded" if s3 else "no R2 credentials, nothing uploaded")
 
 
 if __name__ == "__main__":
