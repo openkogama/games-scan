@@ -22,7 +22,8 @@ PRODUCT_SHAPES = 3
 MIN_CUBES = 8
 TOP_MAPS = 5
 MAGIC = b"OKM1"
-FORMAT = 2
+FORMAT = 3
+CARD = struct.Struct("<32sIIfBHIIH")
 BUCKETS = 16
 PACKS = 4096
 PAGE_SIZE = 4096
@@ -325,6 +326,7 @@ CREATE TABLE model_maps (model INTEGER NOT NULL, map INTEGER NOT NULL, PRIMARY K
 CREATE TABLE model_authors (model INTEGER NOT NULL, author INTEGER NOT NULL, PRIMARY KEY (model, author)) WITHOUT ROWID;
 CREATE TABLE model_items (model INTEGER NOT NULL, item INTEGER NOT NULL, PRIMARY KEY (model, item)) WITHOUT ROWID;
 CREATE VIRTUAL TABLE map_search USING fts5(name, content='maps', content_rowid='id');
+CREATE VIRTUAL TABLE model_search USING fts5(words, content='', detail='none');
 """
 
 INDEXES = """
@@ -334,7 +336,12 @@ CREATE INDEX model_maps_map ON model_maps(map, model);
 CREATE INDEX model_authors_author ON model_authors(author, model);
 CREATE INDEX model_items_item ON model_items(item, model);
 INSERT INTO map_search(map_search) VALUES ('rebuild');
+INSERT INTO model_search(model_search) VALUES ('optimize');
 """
+
+
+def scale_word(scale):
+    return "zzscale" + f"{scale:g}".replace(".", "")
 
 
 def index(paths, build):
@@ -358,8 +365,16 @@ def index(paths, build):
     db.execute("PRAGMA journal_mode = DELETE")
     db.executescript(SCHEMA)
 
-    top, used_games = [], set()
-    rows, links, authors, items = [], [], [], []
+    names = {}
+
+    def name(game):
+        if game not in names:
+            names[game] = repaired(games[game].get("name") or "")
+        return names[game]
+
+    top, used_games, first_games = [], set(), set()
+    rows, links, authors, items, words = [], [], [], [], []
+    cards = bytearray()
     for rank, sha in enumerate(order, 1):
         m = models[sha]
         map_count = len(set(m["games"]))
@@ -369,6 +384,9 @@ def index(paths, build):
                      ",".join(str(x) for x in m["materials"]), int(image), number, offset, length))
         samples = list(dict.fromkeys(m["games"]))[:SAMPLES]
         used_games.update(samples)
+        first_games.update(samples[:1])
+        cards += CARD.pack(bytes.fromhex(sha), map_count, m["cubes"], m["scale"], int(image), number, offset, length, samples[0] + 1 if samples else 0)
+        words.append((rank, " ".join([name(game) for game in samples] + [scale_word(m["scale"])])))
         links.extend((rank, game + 1) for game in samples)
         authors.extend((rank, author) for author, _ in m["authors"].most_common(SAMPLES))
         items.extend((rank, item) for item, _ in m["items"].most_common() if item in products)
@@ -376,19 +394,29 @@ def index(paths, build):
             top.append({"sha256": sha, "pack": number, "offset": offset, "length": length})
     db.executemany("INSERT INTO models VALUES (" + ",".join("?" * 15) + ")", rows)
     db.executemany("INSERT INTO maps VALUES (?, ?, ?, ?)",
-                   [(game + 1, games[game].get("site") or "", games[game].get("id") or "", repaired(games[game].get("name") or "")) for game in sorted(used_games)])
+                   [(game + 1, games[game].get("site") or "", games[game].get("id") or "", name(game)) for game in sorted(used_games)])
     db.executemany("INSERT INTO model_maps VALUES (?, ?)", links)
     db.executemany("INSERT INTO model_authors VALUES (?, ?)", authors)
     db.executemany("INSERT INTO model_items VALUES (?, ?)", items)
+    db.executemany("INSERT INTO model_search(rowid, words) VALUES (?, ?)", words)
     db.executescript(INDEXES)
     db.commit()
     db.execute("ANALYZE")
     db.execute("VACUUM")
     db.close()
+    with open("out/cards.bin", "wb") as f:
+        f.write(cards)
+    titles = [""] * (max(first_games, default=-1) + 2)
+    for game in first_games:
+        titles[game + 1] = name(game)
+    with open("out/maps.json", "w", encoding="utf-8") as f:
+        json.dump(titles, f, ensure_ascii=False, separators=(",", ":"))
 
     s3 = client()
     base = build_prefix(build)
     upload_file(s3, base + "models.db", "out/models.db", "application/octet-stream", IMMUTABLE)
+    upload_file(s3, base + "cards.bin", "out/cards.bin", "application/octet-stream", IMMUTABLE)
+    upload_file(s3, base + "maps.json", "out/maps.json", "application/json; charset=utf-8", IMMUTABLE)
     materials = {}
     if os.path.exists("out/materials/materials.json"):
         with open("out/materials/materials.json", encoding="utf-8") as f:
@@ -404,6 +432,8 @@ def index(paths, build):
         "images": len(top),
         "packs": PACKS,
         "database": {"path": "models.db", "bytes": os.path.getsize("out/models.db"), "pageSize": PAGE_SIZE},
+        "cards": {"path": "cards.bin", "record": CARD.size},
+        "titles": "maps.json",
         "materials": {key: value for key, value in materials.items() if key != "colors"},
     }
     with open("out/latest.json", "w", encoding="utf-8") as f:
