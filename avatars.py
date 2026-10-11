@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -23,7 +24,8 @@ BLUEPRINT = 45
 BUILD_AVATAR = 133
 CLASS = 134
 PARTS = ("Head", "Torso", "LArm", "RArm", "LUpLeg", "LLowLeg", "RUpLeg", "RLowLeg")
-SOURCES = {"map": 1, "build": 2, "class": 4, "world": 8}
+TURNED = {"Torso": (180, (-0.5, 1.5)), "LUpLeg": (-90, None), "RUpLeg": (-90, None)}
+SOURCES = {"map": 1, "build": 2, "class": 4, "world": 8, "placed": 16}
 MARKERS = {
     "f85caecbd091ecd9a2f1ae396e1f8c03b59f2f262e5a99433f08133bb2dd46ff",
     "49d779bfda6cb47abe215cc81060774a4949a27c9a3206a3e61ef2cdc760c538",
@@ -64,6 +66,25 @@ def accessories_of(blueprint):
     return found
 
 
+def turned(name, relative, rotation, scale, cubes):
+    if name not in TURNED or not cubes:
+        return relative, rotation
+    angle, pivot = TURNED[name]
+    if pivot is None:
+        xs, _, zs = zip(*cubes)
+        pivot = ((min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2)
+    x, y, z, w = rotation
+    local = (pivot[0] * scale, 0.0, pivot[1] * scale)
+    tx, ty, tz = 2 * (y * local[2] - z * local[1]), 2 * (z * local[0] - x * local[2]), 2 * (x * local[1] - y * local[0])
+    cx = relative[0] + local[0] + w * tx + (y * tz - z * ty)
+    cz = relative[2] + local[2] + w * tz + (x * ty - y * tx)
+    c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    half_c, half_s = math.cos(math.radians(angle) / 2), math.sin(math.radians(angle) / 2)
+    dx, dz = relative[0] - cx, relative[2] - cz
+    moved = [cx + c * dx + s * dz, relative[1], cz - s * dx + c * dz]
+    return moved, (half_c * x + half_s * z, half_c * y + half_s * w, half_c * z - half_s * x, half_c * w - half_s * y)
+
+
 def avatar_blob(parts, accessories):
     origin = parts["Torso"][0] if "Torso" in parts else (0.0, 0.0, 0.0)
     out = bytearray(MAGIC)
@@ -73,7 +94,8 @@ def avatar_blob(parts, accessories):
             out.append(0)
             continue
         position, rotation, scale, cubes = parts[name]
-        relative = [round((p - o) * 1024) / 1024 for p, o in zip(position, origin)]
+        relative, rotation = turned(name, [p - o for p, o in zip(position, origin)], rotation, scale, cubes)
+        relative = [round(v * 1024) / 1024 for v in relative]
         data = canonical(cubes)
         out.append(1)
         out += struct.pack(">8f", *relative, *quaternion(rotation), scale) + struct.pack(">I", len(data)) + data
@@ -119,15 +141,13 @@ def avatars_in(batches):
         return (parts, accessories_of(data)) if parts else None
 
     found = {}
-    for wid, (_, kind, _, values) in objects.items():
-        if kind == CLASS:
-            blueprint = table(table(table(values).get("BlueprintData")).get("ChildrenMap")).get("bodyId")
-            source = "class"
-        elif kind in (AVATAR, BUILD_AVATAR) and wid not in inside_class:
-            blueprint = next((child for child in children[wid] if objects[child][1] == BLUEPRINT), None)
-            source = "build" if kind == BUILD_AVATAR else "map"
-        else:
+    for blueprint, (parent, kind, _, _) in objects.items():
+        if kind != BLUEPRINT:
             continue
+        holder = objects[parent][1] if parent in objects else None
+        if holder == AVATAR and parent in inside_class:
+            continue
+        source = {CLASS: "class", BUILD_AVATAR: "build", AVATAR: "map"}.get(holder, "placed")
         result = body(blueprint)
         if result is None:
             continue
