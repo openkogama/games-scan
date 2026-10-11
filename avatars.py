@@ -24,7 +24,22 @@ BLUEPRINT = 45
 BUILD_AVATAR = 133
 CLASS = 134
 PARTS = ("Head", "Torso", "LArm", "RArm", "LUpLeg", "LLowLeg", "RUpLeg", "RLowLeg")
-TURNED = {"Torso": (180, (-0.5, 1.5)), "LUpLeg": (-90, None), "RUpLeg": (-90, None)}
+BONES = {"Head": "root/head", "Torso": "root", "LArm": "root/L_arm", "RArm": "root/R_arm",
+         "LUpLeg": "root/L_hip", "LLowLeg": "root/L_hip/L_knee", "RUpLeg": "root/R_hip", "RLowLeg": "root/R_hip/R_knee"}
+IDLE = {
+    "root": ((0.0, 0.4718, -0.0338), (0.0, 0.0, 0.0, 1.0)),
+    "root/head": ((0.0, 0.6166, 0.0338), (0.0, 0.0, 0.0, 1.0)),
+    "root/L_arm": ((-0.3595, 0.5477, 0.0236), (0.0344, -0.0438, 0.6168, 0.7852)),
+    "root/R_arm": ((0.3595, 0.5477, 0.0236), (-0.0271, -0.0334, -0.6289, 0.7763)),
+    "root/L_hip": ((-0.18, 0.0, 0.0), (0.0, -0.1771, 0.0, 0.9842)),
+    "root/L_hip/L_knee": ((0.0, -0.2457, 0.0), (0.0, 0.0, 0.0, 1.0)),
+    "root/R_hip": ((0.18, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+    "root/R_hip/R_knee": ((0.0, -0.2457, 0.0), (0.0, 0.0, 0.0, 1.0)),
+}
+OFFSETS = {"Head": (0.0, -7.7, -1.5), "Torso": (0.0, -2.8, -1.5), "LArm": (0.5, -7.5, 2.0), "RArm": (0.5, -7.5, 2.0),
+           "LUpLeg": (-1.0, -1.5, 0.0), "LLowLeg": (-1.0, -1.5, 0.0), "RUpLeg": (-1.0, -1.5, 0.0), "RLowLeg": (-1.0, -1.5, 0.0)}
+LOOK = {"Head": ((1, 0, 0), (0, 1, 0)), "Torso": ((-1, 0, 0), (0, 1, 0)), "LArm": ((0, -1, 0), (1, 0, 0)), "RArm": ((0, -1, 0), (-1, 0, 0)),
+        "LUpLeg": ((0, 0, 1), (0, 1, 0)), "LLowLeg": ((1, 0, 0), (0, 1, 0)), "RUpLeg": ((0, 0, 1), (0, 1, 0)), "RLowLeg": ((1, 0, 0), (0, 1, 0))}
 SOURCES = {"map": 1, "build": 2, "class": 4, "world": 8, "placed": 16}
 MARKERS = {
     "f85caecbd091ecd9a2f1ae396e1f8c03b59f2f262e5a99433f08133bb2dd46ff",
@@ -66,36 +81,71 @@ def accessories_of(blueprint):
     return found
 
 
-def turned(name, relative, rotation, scale, cubes):
-    if name not in TURNED or not cubes:
-        return relative, rotation
-    angle, pivot = TURNED[name]
-    if pivot is None:
-        xs, _, zs = zip(*cubes)
-        pivot = ((min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2)
-    x, y, z, w = rotation
-    local = (pivot[0] * scale, 0.0, pivot[1] * scale)
-    tx, ty, tz = 2 * (y * local[2] - z * local[1]), 2 * (z * local[0] - x * local[2]), 2 * (x * local[1] - y * local[0])
-    cx = relative[0] + local[0] + w * tx + (y * tz - z * ty)
-    cz = relative[2] + local[2] + w * tz + (x * ty - y * tx)
-    c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
-    half_c, half_s = math.cos(math.radians(angle) / 2), math.sin(math.radians(angle) / 2)
-    dx, dz = relative[0] - cx, relative[2] - cz
-    moved = [cx + c * dx + s * dz, relative[1], cz - s * dx + c * dz]
-    return moved, (half_c * x + half_s * z, half_c * y + half_s * w, half_c * z - half_s * x, half_c * w - half_s * y)
+def multiply(a, b):
+    return [[sum(a[r][k] * b[k][c] for k in range(3)) for c in range(3)] for r in range(3)]
+
+
+def transform(m, v):
+    return [sum(m[r][k] * v[k] for k in range(3)) for r in range(3)]
+
+
+def matrix(q):
+    x, y, z, w = q
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+def look_rotation(forward, up):
+    right = [up[1] * forward[2] - up[2] * forward[1], up[2] * forward[0] - up[0] * forward[2], up[0] * forward[1] - up[1] * forward[0]]
+    upward = [forward[1] * right[2] - forward[2] * right[1], forward[2] * right[0] - forward[0] * right[2], forward[0] * right[1] - forward[1] * right[0]]
+    return [[right[r], upward[r], forward[r]] for r in range(3)]
+
+
+def rotation_of(m):
+    trace = m[0][0] + m[1][1] + m[2][2]
+    if trace > 0:
+        s = math.sqrt(trace + 1) * 2
+        return [(m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s, s / 4]
+    if m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+        s = math.sqrt(1 + m[0][0] - m[1][1] - m[2][2]) * 2
+        return [s / 4, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s, (m[2][1] - m[1][2]) / s]
+    if m[1][1] > m[2][2]:
+        s = math.sqrt(1 + m[1][1] - m[0][0] - m[2][2]) * 2
+        return [(m[0][1] + m[1][0]) / s, s / 4, (m[1][2] + m[2][1]) / s, (m[0][2] - m[2][0]) / s]
+    s = math.sqrt(1 + m[2][2] - m[0][0] - m[1][1]) * 2
+    return [(m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, s / 4, (m[1][0] - m[0][1]) / s]
+
+
+def bone(path):
+    position, rotation = [0.0, 0.0, 0.0], matrix((0.0, 0.0, 0.0, 1.0))
+    names = path.split("/")
+    for depth in range(1, len(names) + 1):
+        local_position, local_rotation = IDLE["/".join(names[:depth])]
+        position = [p + d for p, d in zip(position, transform(rotation, local_position))]
+        rotation = multiply(rotation, matrix(local_rotation))
+    return position, rotation
+
+
+def placement(name, scale):
+    attach = look_rotation(*LOOK[name])
+    offset = transform(attach, [v * scale for v in OFFSETS[name]])
+    position, rotation = bone(BONES[name])
+    world = [p + d for p, d in zip(position, transform(rotation, offset))]
+    return [round(v * 10000) / 10000 for v in world], rotation_of(multiply(rotation, attach))
 
 
 def avatar_blob(parts, accessories):
-    origin = parts["Torso"][0] if "Torso" in parts else (0.0, 0.0, 0.0)
     out = bytearray(MAGIC)
     out.append(len(PARTS))
     for name in PARTS:
         if name not in parts:
             out.append(0)
             continue
-        position, rotation, scale, cubes = parts[name]
-        relative, rotation = turned(name, [p - o for p, o in zip(position, origin)], rotation, scale, cubes)
-        relative = [round(v * 1024) / 1024 for v in relative]
+        _, _, scale, cubes = parts[name]
+        relative, rotation = placement(name, scale)
         data = canonical(cubes)
         out.append(1)
         out += struct.pack(">8f", *relative, *quaternion(rotation), scale) + struct.pack(">I", len(data)) + data
