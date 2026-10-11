@@ -35,8 +35,8 @@ IMMUTABLE = "public, max-age=31536000, immutable"
 SHORT = "public, max-age=300"
 
 
-def build_prefix(build):
-    return f"{PREFIX}builds/{build}/"
+def build_prefix(build, prefix=PREFIX):
+    return f"{prefix}builds/{build}/"
 
 
 def unique_games():
@@ -237,9 +237,9 @@ def records(path):
         pos += 36 + size
 
 
-def pack(folder, build):
+def pack(folder, build, prefix=PREFIX):
     s3 = client()
-    target = build_prefix(build) + "packs/"
+    target = build_prefix(build, prefix) + "packs/"
     os.makedirs("out/packs", exist_ok=True)
     per_bucket = PACKS // BUCKETS
     total, written = 0, 0
@@ -268,7 +268,7 @@ def pack(folder, build):
             print(f"bucket {bucket:x}: {len(found)} models", flush=True)
         for future in sent:
             future.result()
-    print(f"{total} models in {len(sent)} packs, {written // 1024 // 1024} MB")
+    print(f"{total} entries in {len(sent)} packs, {written // 1024 // 1024} MB")
 
 
 def repaired(text):
@@ -466,16 +466,16 @@ def index(paths, build):
     print(f"{maps} maps, {errors} errors, {len(order)} models, {len(top)} with images, database {latest['database']['bytes'] // 1024 // 1024} MB")
 
 
-def publish():
+def publish(prefix=PREFIX):
     s3 = client()
     with open("out/latest.json", "rb") as f:
-        upload(s3, PREFIX + "latest.json", f.read(), "application/json", SHORT)
+        upload(s3, prefix + "latest.json", f.read(), "application/json", SHORT)
     if not s3:
         return
     builds = defaultdict(lambda: [None, []])
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=PREFIX + "builds/"):
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix + "builds/"):
         for item in page.get("Contents", []):
-            build = item["Key"][len(PREFIX + "builds/") :].split("/")[0]
+            build = item["Key"][len(prefix + "builds/") :].split("/")[0]
             entry = builds[build]
             entry[0] = max(entry[0], item["LastModified"]) if entry[0] else item["LastModified"]
             entry[1].append(item["Key"])

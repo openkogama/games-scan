@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import struct
 import urllib.request
 import zlib
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -9,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 from PIL import Image
 
-from models import IDENTITY, IMMUTABLE, build_prefix, cubes_of, split_blob, upload
+from models import IDENTITY, IMMUTABLE, PREFIX, build_prefix, cubes_of, split_blob, upload
 from scan import client
 
 CDN = "https://cdn.openkogama.org/"
@@ -26,6 +27,8 @@ AMBIENT = 0.45
 OCCLUSION = 0.5
 NEAR = 0.05
 MAX_TRIANGLES = 200_000
+AVATAR_MAGIC = b"OKA1"
+AVATAR_TURN = -90.0
 
 FACES = [
     ([0, 1, 2, 3], (0, 1, 0), 1, 2),
@@ -101,6 +104,45 @@ def triangles(cubes, scale, count, fallback):
             np.array(materials, dtype=np.int32), np.array(normals, dtype=np.float64))
 
 
+def quaternion_matrix(x, y, z, w):
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def parts_of(data):
+    if data[:4] != AVATAR_MAGIC:
+        scale, cube_data = split_blob(data)
+        return [(cubes_of(cube_data), scale, np.eye(3), np.zeros(3))], 0.0
+    pos = 5
+    parts = []
+    for _ in range(data[4]):
+        present = data[pos]
+        pos += 1
+        if not present:
+            continue
+        values = struct.unpack(">8f", data[pos : pos + 32])
+        size = struct.unpack(">I", data[pos + 32 : pos + 36])[0]
+        pos += 36
+        parts.append((cubes_of(data[pos : pos + size]), values[7], quaternion_matrix(*values[3:7]), np.array(values[:3])))
+        pos += size
+    return parts, AVATAR_TURN
+
+
+def geometry(data, count, fallback):
+    parts, turn = parts_of(data)
+    pieces = []
+    for cubes, scale, rotation, offset in parts:
+        tris, uvs, lights, mats, normals = triangles(cubes, scale, count, fallback)
+        if len(tris):
+            pieces.append((tris * scale @ rotation.T + offset, uvs, lights, mats, normals @ rotation.T))
+    if not pieces:
+        return None, turn
+    return tuple(np.concatenate(column) for column in zip(*pieces)), turn
+
+
 def yaw(degrees):
     t = math.radians(degrees)
     return np.array([[math.cos(t), 0, math.sin(t)], [0, 1, 0], [-math.sin(t), 0, math.cos(t)]])
@@ -131,15 +173,16 @@ def sample(tile, u, v):
 
 def render(data, materials, size=SIZE):
     tiles, emission, fallback = materials
-    scale, cube_data = split_blob(data)
-    cubes = cubes_of(cube_data)
-    tris, uvs, lights, mats, face_normals = triangles(cubes, scale, len(tiles), fallback)
-    if len(tris) == 0 or len(tris) > MAX_TRIANGLES:
+    built, turn = geometry(data, len(tiles), fallback)
+    if built is None:
+        return None
+    tris, uvs, lights, mats, face_normals = built
+    if len(tris) > MAX_TRIANGLES:
         return None
 
     flat = tris.reshape(-1, 3)
     low, high = flat.min(axis=0), flat.max(axis=0)
-    rotation = yaw(TURN)
+    rotation = yaw(TURN + turn)
     tris = ((tris - (low + high) / 2) * (PREVIEW_SIZE / max(high - low))) @ rotation.T
 
     normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
@@ -238,14 +281,14 @@ def render_file(job):
         return f"error {e}"
 
 
-def packed_model(build, entry):
+def packed_model(build, entry, prefix):
     local = f"out/packs/{entry['pack']:03x}.bin"
     if os.path.exists(local):
         with open(local, "rb") as f:
             f.seek(entry["offset"])
             return f.read(entry["length"])
     end = entry["offset"] + entry["length"] - 1
-    url = f"{CDN}{build_prefix(build)}packs/{entry['pack']:03x}.bin"
+    url = f"{CDN}{build_prefix(build, prefix)}packs/{entry['pack']:03x}.bin"
     request = urllib.request.Request(url, headers={"User-Agent": "games-scan", "Range": f"bytes={entry['offset']}-{end}"})
     for attempt in range(3):
         try:
@@ -256,12 +299,12 @@ def packed_model(build, entry):
     raise RuntimeError(error)
 
 
-def fetch(build, entry, folder):
+def fetch(build, entry, folder, prefix):
     path = os.path.join(folder, entry["sha256"] + ".bin")
     if os.path.exists(path):
         return True
     try:
-        data = zlib.decompress(packed_model(build, entry))
+        data = zlib.decompress(packed_model(build, entry, prefix))
     except Exception:
         return False
     with open(path, "wb") as f:
@@ -285,16 +328,16 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     os.makedirs(args.models, exist_ok=True)
-    build = None
+    build, prefix = None, PREFIX
     if args.catalog:
         with open(args.catalog, encoding="utf-8") as f:
             catalog = json.load(f)
-        build = catalog["build"]
+        build, prefix = catalog["build"], catalog.get("prefix", PREFIX)
         entries = catalog["models"][args.shard :: args.shards]
         if args.limit:
             entries = entries[: args.limit]
         with ThreadPoolExecutor(16) as pool:
-            fetched = list(pool.map(lambda entry: fetch(build, entry, args.models), entries))
+            fetched = list(pool.map(lambda entry: fetch(build, entry, args.models, prefix), entries))
         names = [entry["sha256"] + ".bin" for entry, ok in zip(entries, fetched) if ok]
         print(f"shard {args.shard}/{args.shards}: {len(names)} of {len(entries)} models fetched", flush=True)
     else:
@@ -316,7 +359,7 @@ def main():
 
         def send(name):
             with open(os.path.join(args.out, name), "rb") as f:
-                upload(s3, build_prefix(build) + "images/" + name, f.read(), "image/png", IMMUTABLE)
+                upload(s3, build_prefix(build, prefix) + "images/" + name, f.read(), "image/png", IMMUTABLE)
 
         with ThreadPoolExecutor(16) as pool:
             list(pool.map(send, images))

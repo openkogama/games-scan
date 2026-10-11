@@ -1,0 +1,108 @@
+name: avatars
+
+on:
+  workflow_dispatch:
+
+env:
+  R2_ACCOUNT_ID: f1b5019a1d5ee73f9494a30464733335
+  ATLAS: https://cdn.openkogama.org/eu/kogama_assets/v96/kogama_assets_u5/AssetBundles/Atlas/atlasmid.unity3d
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python avatars.py --shard ${{ matrix.shard }} --shards 16
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avatars-${{ matrix.shard }}
+          path: out/avatars-${{ matrix.shard }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avatar-blobs-${{ matrix.shard }}
+          path: out/avatar-blobs-${{ matrix.shard }}
+
+  build:
+    runs-on: ubuntu-latest
+    needs: scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3 Pillow UnityPy
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: avatar-blobs-*
+          path: blobs
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: avatars-*
+          path: shards
+          merge-multiple: true
+      - run: curl -sSfL -o atlasmid.unity3d "$ATLAS"
+      - run: python materials.py --atlas atlasmid.unity3d
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python avatars.py --pack blobs --build ${{ github.run_id }}
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python avatars.py --index shards/*.json --build ${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: |
+            out/latest.json
+            out/top.json
+
+  render:
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3 numpy Pillow UnityPy
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: out
+      - run: curl -sSfL -o atlasmid.unity3d "$ATLAS"
+      - run: python materials.py --atlas atlasmid.unity3d
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python render.py --catalog out/top.json --shard ${{ matrix.shard }} --shards 8 --upload
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build, render]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: out
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python avatars.py --publish
