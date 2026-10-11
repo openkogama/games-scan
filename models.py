@@ -3,6 +3,7 @@ import glob
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import struct
 import sys
@@ -24,6 +25,7 @@ TOP_MAPS = 5
 MAGIC = b"OKM1"
 FORMAT = 3
 CARD = struct.Struct("<32sIIfBHIIH")
+CARDS_PER_FILE = 16384
 BUCKETS = 16
 PACKS = 4096
 PAGE_SIZE = 4096
@@ -326,7 +328,6 @@ CREATE TABLE model_maps (model INTEGER NOT NULL, map INTEGER NOT NULL, PRIMARY K
 CREATE TABLE model_authors (model INTEGER NOT NULL, author INTEGER NOT NULL, PRIMARY KEY (model, author)) WITHOUT ROWID;
 CREATE TABLE model_items (model INTEGER NOT NULL, item INTEGER NOT NULL, PRIMARY KEY (model, item)) WITHOUT ROWID;
 CREATE VIRTUAL TABLE map_search USING fts5(name, content='maps', content_rowid='id');
-CREATE VIRTUAL TABLE model_search USING fts5(words, content='', detail='none');
 """
 
 INDEXES = """
@@ -336,8 +337,21 @@ CREATE INDEX model_maps_map ON model_maps(map, model);
 CREATE INDEX model_authors_author ON model_authors(author, model);
 CREATE INDEX model_items_item ON model_items(item, model);
 INSERT INTO map_search(map_search) VALUES ('rebuild');
-INSERT INTO model_search(model_search) VALUES ('optimize');
 """
+
+
+def search_database(words):
+    if os.path.exists("out/search.db"):
+        os.remove("out/search.db")
+    db = sqlite3.connect("out/search.db")
+    db.execute(f"PRAGMA page_size = {PAGE_SIZE}")
+    db.execute("PRAGMA journal_mode = DELETE")
+    db.execute("CREATE VIRTUAL TABLE model_search USING fts5(words, content='', detail='none')")
+    db.executemany("INSERT INTO model_search(rowid, words) VALUES (?, ?)", words)
+    db.execute("INSERT INTO model_search(model_search) VALUES ('optimize')")
+    db.commit()
+    db.execute("VACUUM")
+    db.close()
 
 
 def scale_word(scale):
@@ -400,14 +414,18 @@ def index(paths, build):
     db.executemany("INSERT INTO model_maps VALUES (?, ?)", links)
     db.executemany("INSERT INTO model_authors VALUES (?, ?)", authors)
     db.executemany("INSERT INTO model_items VALUES (?, ?)", items)
-    db.executemany("INSERT INTO model_search(rowid, words) VALUES (?, ?)", words)
     db.executescript(INDEXES)
     db.commit()
     db.execute("ANALYZE")
     db.execute("VACUUM")
     db.close()
-    with open("out/cards.bin", "wb") as f:
-        f.write(cards)
+    search_database(words)
+    shutil.rmtree("out/cards", ignore_errors=True)
+    os.makedirs("out/cards")
+    chunk = CARDS_PER_FILE * CARD.size
+    for number, start in enumerate(range(0, len(cards), chunk)):
+        with open(f"out/cards/{number:03x}.bin", "wb") as f:
+            f.write(cards[start : start + chunk])
     titles = [""] * (max(first_games, default=-1) + 2)
     for game in first_games:
         titles[game + 1] = name(game)
@@ -417,7 +435,9 @@ def index(paths, build):
     s3 = client()
     base = build_prefix(build)
     upload_file(s3, base + "database.bin", "out/models.db", "application/octet-stream", IMMUTABLE)
-    upload_file(s3, base + "cards.bin", "out/cards.bin", "application/octet-stream", IMMUTABLE)
+    upload_file(s3, base + "search.bin", "out/search.db", "application/octet-stream", IMMUTABLE)
+    for name in sorted(os.listdir("out/cards")):
+        upload_file(s3, base + "cards/" + name, os.path.join("out/cards", name), "application/octet-stream", IMMUTABLE)
     upload_file(s3, base + "maps.json", "out/maps.json", "application/json; charset=utf-8", IMMUTABLE)
     materials = {}
     if os.path.exists("out/materials/materials.json"):
@@ -434,7 +454,8 @@ def index(paths, build):
         "images": len(top),
         "packs": PACKS,
         "database": {"path": "database.bin", "bytes": os.path.getsize("out/models.db"), "pageSize": PAGE_SIZE},
-        "cards": {"path": "cards.bin", "record": CARD.size},
+        "search": {"path": "search.bin", "bytes": os.path.getsize("out/search.db"), "pageSize": PAGE_SIZE},
+        "cards": {"path": "cards/", "record": CARD.size, "perFile": CARDS_PER_FILE},
         "titles": "maps.json",
         "materials": {key: value for key, value in materials.items() if key != "colors"},
     }
