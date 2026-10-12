@@ -145,13 +145,17 @@ def image_of(site, uuid):
 
 def wanted_maps(index_path):
     rows = json.load(open(index_path, encoding="utf-8"))["rows"]
-    wanted, authors = set(), {}
+    wanted, authors, plays = set(), {}, {}
     for r in rows:
         if r[0] and r[1] in HOSTS:
-            wanted.add(f"{r[1]}:{r[0]}")
+            key = f"{r[1]}:{r[0]}"
+            wanted.add(key)
+            plays[key] = max(plays.get(key, 0), r[5] or 0)
             if r[4]:
-                authors.setdefault(f"{r[1]}:profile:{r[4]}", set()).add(f"{r[1]}:{r[0]}")
-    return wanted, authors
+                authors.setdefault(f"{r[1]}:profile:{r[4]}", set()).add(key)
+    for profile, maps in authors.items():
+        plays[profile] = max(plays[key] for key in maps)
+    return wanted, authors, plays
 
 
 def load_captures():
@@ -194,11 +198,11 @@ def fetch(shard, shards, index_path, limit, minutes):
     deadline = DEADLINE = time.time() + minutes * 60
     s3 = client()
     captured = load_captures()
-    wanted, authors = wanted_maps(index_path)
+    wanted, authors, plays = wanted_maps(index_path)
     done_pages, stored = load_state(s3)
     pages = {k for k in wanted if k in captured}
     pages |= {p for p, maps in authors.items() if p in captured and not maps <= pages}
-    jobs = [k for k in sorted(pages) if k not in done_pages][shard::shards]
+    jobs = [k for k in sorted(pages, key=lambda k: (-plays.get(k, 0), k)) if k not in done_pages][shard::shards]
     if limit:
         jobs = jobs[:limit]
     print(f"shard {shard}/{shards}: {len(jobs)} pages left, {len(done_pages)} done, {sum(1 for v in stored.values() if v.get('source'))} images stored", flush=True)
