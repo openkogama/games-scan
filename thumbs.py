@@ -21,6 +21,7 @@ BUCKETS = {
 SIZES = ("350x194", "184x100", "600x240")
 UUID = r"([0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12})"
 GAME = r"_(?:184x100|350x194|600x240|350x175)"
+DEADLINE = PAGES_DEADLINE = float("inf")
 
 
 def get(url, attempts=6, timeout=120):
@@ -126,15 +127,17 @@ def image_of(site, uuid):
         data = get(BUCKETS[site] + key_of(uuid, size), attempts=2)
         if data:
             return data, "bucket"
+    if time.time() > DEADLINE:
+        return None, None
+    prefix = f"{STATIC[site]}/{key_of(uuid, '')[:-5]}"
+    text = get(f"{WAYBACK}cdx/search/cdx?url={prefix}&matchType=prefix&filter=statuscode:200&fl=timestamp,original", attempts=3)
+    captures = [line.split()[:2] for line in (text or b"").decode().splitlines() if len(line.split()) >= 2]
     for size in SIZES:
-        url = f"{STATIC[site]}/gen_cache/{key_of(uuid, size)[len('gen_cache/'):]}"
-        text = get(f"{WAYBACK}cdx/search/cdx?url={url}&filter=statuscode:200&fl=timestamp,original&limit=-1")
-        line = (text or b"").decode().strip().splitlines()
-        if line:
-            ts, original = line[-1].split()[:2]
-            data = get(f"{WAYBACK}web/{ts}id_/{original}")
-            if data and data[:2] == b"\xff\xd8":
-                return data, "wayback"
+        for ts, original in captures:
+            if f"_{size}.jpg" in original:
+                data = get(f"{WAYBACK}web/{ts}id_/{original}", attempts=3)
+                if data and data[:2] == b"\xff\xd8":
+                    return data, "wayback"
     return None, None
 
 
@@ -159,7 +162,10 @@ def load_captures():
     return captured
 
 
-def fetch(shard, shards, index_path, limit):
+def fetch(shard, shards, index_path, limit, minutes):
+    global DEADLINE, PAGES_DEADLINE
+    DEADLINE = time.time() + minutes * 60
+    PAGES_DEADLINE = time.time() + minutes * 60 * 0.6
     captured = load_captures()
     wanted, authors = wanted_maps(index_path)
     pages = {k for k in wanted if k in captured}
@@ -175,6 +181,8 @@ def fetch(shard, shards, index_path, limit):
     def page(key):
         site, *rest = key.split(":")
         game = rest[-1] if len(rest) == 1 else None
+        if time.time() > PAGES_DEADLINE:
+            return site, game, {}
         ts, url = captured[key]
         html = get(f"{WAYBACK}web/{ts}id_/{url}")
         time.sleep(1)
@@ -201,9 +209,11 @@ def fetch(shard, shards, index_path, limit):
                 f.write(data)
         return key, uuid, source
 
-    with ThreadPoolExecutor(4) as pool:
-        for key, uuid, source in pool.map(store, sorted(found.items())):
+    with ThreadPoolExecutor(6) as pool:
+        for done, (key, uuid, source) in enumerate(pool.map(store, sorted(found.items())), 1):
             sources[key] = {"image": uuid, "source": source}
+            if done % 200 == 0:
+                print(f"{done}/{len(found)} images stored", flush=True)
     with open(f"out/thumbs-{shard}.json", "w") as f:
         json.dump(sources, f)
     counts = {}
@@ -221,8 +231,9 @@ if __name__ == "__main__":
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--shards", type=int, default=1)
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--minutes", type=float, default=240)
     args = p.parse_args()
     if args.captures:
         captures(args.shard, args.shards)
     else:
-        fetch(args.shard, args.shards, args.index, args.limit)
+        fetch(args.shard, args.shards, args.index, args.limit, args.minutes)
