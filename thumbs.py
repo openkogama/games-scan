@@ -21,21 +21,25 @@ BUCKETS = {
 SIZES = ("350x194", "184x100", "600x240")
 UUID = r"([0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12})"
 GAME = r"_(?:184x100|350x194|600x240|350x175)"
-DEADLINE = PAGES_DEADLINE = float("inf")
+
+
+DEADLINE = float("inf")
 
 
 def get(url, attempts=6, timeout=120):
     for attempt in range(attempts):
+        if time.time() > DEADLINE:
+            return None
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "openkogama-games-scan"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=min(timeout, max(5, DEADLINE - time.time()))) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
             if e.code in (403, 404):
                 return None
         except Exception:
             pass
-        time.sleep(min(120, 10 * 2 ** attempt))
+        time.sleep(max(0, min(120, 10 * 2 ** attempt, DEADLINE - time.time())))
     return None
 
 
@@ -127,8 +131,6 @@ def image_of(site, uuid):
         data = get(BUCKETS[site] + key_of(uuid, size), attempts=2)
         if data:
             return data, "bucket"
-    if time.time() > DEADLINE:
-        return None, None
     prefix = f"{STATIC[site]}/{key_of(uuid, '')[:-5]}"
     text = get(f"{WAYBACK}cdx/search/cdx?url={prefix}&matchType=prefix&filter=statuscode:200&fl=timestamp,original", attempts=3)
     captures = [line.split()[:2] for line in (text or b"").decode().splitlines() if len(line.split()) >= 2]
@@ -162,64 +164,100 @@ def load_captures():
     return captured
 
 
+STATE = "maps/v1/thumbs/"
+IMAGES = "maps/v1/images/"
+
+
+def load_state(s3):
+    pages, stored = set(), {}
+    if not s3:
+        return pages, stored
+    from scan import BUCKET
+
+    for listing in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=STATE):
+        for item in listing.get("Contents", []):
+            state = json.loads(s3.get_object(Bucket=BUCKET, Key=item["Key"])["Body"].read())
+            pages.update(state["pages"])
+            for key, value in state["stored"].items():
+                if value.get("source") or key not in stored:
+                    stored[key] = value
+    return pages, stored
+
+
 def fetch(shard, shards, index_path, limit, minutes):
-    global DEADLINE, PAGES_DEADLINE
-    DEADLINE = time.time() + minutes * 60
-    PAGES_DEADLINE = time.time() + minutes * 60 * 0.6
+    from threading import Lock
+
+    from models import IMMUTABLE, SHORT, upload
+    from scan import client
+
+    global DEADLINE
+    deadline = DEADLINE = time.time() + minutes * 60
+    s3 = client()
     captured = load_captures()
     wanted, authors = wanted_maps(index_path)
+    done_pages, stored = load_state(s3)
     pages = {k for k in wanted if k in captured}
     pages |= {p for p, maps in authors.items() if p in captured and not maps <= pages}
-    jobs = sorted(pages)[shard::shards]
+    jobs = [k for k in sorted(pages) if k not in done_pages][shard::shards]
     if limit:
         jobs = jobs[:limit]
-    print(f"shard {shard}/{shards}: {len(jobs)} pages of {len(wanted)} maps", flush=True)
+    print(f"shard {shard}/{shards}: {len(jobs)} pages left, {len(done_pages)} done, {sum(1 for v in stored.values() if v.get('source'))} images stored", flush=True)
     folder = f"out/thumbs-{shard}"
     os.makedirs(folder, exist_ok=True)
-    found = {}
+    lock = Lock()
+    mine = {"pages": [], "stored": {}}
+    saved = [time.time()]
 
-    def page(key):
-        site, *rest = key.split(":")
-        game = rest[-1] if len(rest) == 1 else None
-        if time.time() > PAGES_DEADLINE:
-            return site, game, {}
-        ts, url = captured[key]
-        html = get(f"{WAYBACK}web/{ts}id_/{url}")
-        time.sleep(1)
-        return site, game, pairs(html.decode("utf-8", "ignore"), game) if html else {}
+    def save(force=False):
+        with lock:
+            if not force and time.time() - saved[0] < 300:
+                return
+            saved[0] = time.time()
+            data = json.dumps(mine).encode()
+        upload(s3, f"{STATE}shard-{shard}-of-{shards}.json", data, "application/json", SHORT)
+        with open(f"out/thumbs-{shard}.json", "w") as f:
+            json.dump(mine["stored"], f)
 
-    with ThreadPoolExecutor(3) as pool:
-        for done, (site, game, links) in enumerate(pool.map(page, jobs), 1):
-            for other, uuid in links.items():
-                key = f"{site}:{other}"
-                if key in wanted and (other == game or key not in found):
-                    found[key] = uuid
-            if done % 100 == 0:
-                print(f"{done}/{len(jobs)} pages, {len(found)} images", flush=True)
-
-    sources = {}
-
-    def store(item):
-        key, uuid = item
-        site = key.split(":")[0]
-        path = os.path.join(folder, uuid + ".jpg")
-        data, source = image_of(site, uuid)
+    def store(key, uuid):
+        with lock:
+            if key in stored and (stored[key].get("source") or stored[key]["image"] == uuid):
+                return
+            stored[key] = {"image": uuid, "source": None}
+        data, source = image_of(key.split(":")[0], uuid)
         if data:
+            path = os.path.join(folder, uuid + ".jpg")
             with open(path, "wb") as f:
                 f.write(data)
-        return key, uuid, source
+            upload(s3, f"{IMAGES}{uuid}.jpg", data, "image/jpeg", IMMUTABLE)
+        with lock:
+            stored[key] = mine["stored"][key] = {"image": uuid, "source": source}
 
-    with ThreadPoolExecutor(6) as pool:
-        for done, (key, uuid, source) in enumerate(pool.map(store, sorted(found.items())), 1):
-            sources[key] = {"image": uuid, "source": source}
-            if done % 200 == 0:
-                print(f"{done}/{len(found)} images stored", flush=True)
-    with open(f"out/thumbs-{shard}.json", "w") as f:
-        json.dump(sources, f)
+    def page(key):
+        if time.time() > deadline:
+            return
+        site, *rest = key.split(":")
+        game = rest[-1] if len(rest) == 1 else None
+        ts, url = captured[key]
+        html = get(f"{WAYBACK}web/{ts}id_/{url}")
+        links = pairs(html.decode("utf-8", "ignore"), game) if html else {}
+        own = f"{site}:{game}" if game else None
+        for other, uuid in sorted(links.items(), key=lambda item: f"{site}:{item[0]}" != own):
+            if f"{site}:{other}" in wanted and time.time() < deadline:
+                store(f"{site}:{other}", uuid)
+        if time.time() < deadline:
+            with lock:
+                mine["pages"].append(key)
+        save()
+
+    with ThreadPoolExecutor(4) as pool:
+        for done, _ in enumerate(pool.map(page, jobs), 1):
+            if done % 100 == 0:
+                print(f"{done}/{len(jobs)} pages, {len(mine['stored'])} images this run", flush=True)
+    save(force=True)
     counts = {}
-    for value in sources.values():
+    for value in mine["stored"].values():
         counts[value["source"]] = counts.get(value["source"], 0) + 1
-    print(f"shard {shard}: {len(sources)} images {counts}", flush=True)
+    print(f"shard {shard}: {len(mine['pages'])} pages, {len(mine['stored'])} images {counts}", flush=True)
 
 
 if __name__ == "__main__":

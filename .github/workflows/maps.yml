@@ -12,6 +12,10 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  actions: read
+
 env:
   R2_ACCOUNT_ID: f1b5019a1d5ee73f9494a30464733335
 
@@ -38,32 +42,52 @@ jobs:
     needs: captures
     if: ${{ !cancelled() && inputs.thumbnails }}
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: pip install boto3
       - uses: actions/download-artifact@v4
         if: inputs.refresh
         with:
           pattern: captures-*
           path: captures
           merge-multiple: true
-      - run: |
-          python maps.py --build index
-          python thumbs.py --fetch --shard ${{ matrix.shard }} --shards 32 --minutes 240
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          R2_ACCESS_KEY_ID= python maps.py --build index
+          python thumbs.py --fetch --shard ${{ matrix.shard }} --shards 19 --minutes 330
+
+  progress:
+    needs: captures
+    if: ${{ !cancelled() && inputs.thumbnails }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          name: thumbs-${{ matrix.shard }}
-          path: |
-            out/thumbs-${{ matrix.shard }}.json
-            out/thumbs-${{ matrix.shard }}
+          python-version: "3.12"
+      - run: pip install boto3
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(seq 1 11); do
+            sleep 1500
+            python maps.py --build ${{ github.run_id }}-$n && python maps.py --publish
+            running=$(gh run view ${{ github.run_id }} -R ${{ github.repository }} --json jobs -q '[.jobs[] | select(.name | startswith("thumbs")) | select(.status != "completed")] | length')
+            [ "$running" = 0 ] && break
+          done
 
   index:
     needs: thumbs
@@ -75,11 +99,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install boto3
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: thumbs-*
-          path: out
-          merge-multiple: true
       - env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

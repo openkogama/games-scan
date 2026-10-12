@@ -67,31 +67,23 @@ def pick(group, field):
     return next((game.get(field) for game in group if game.get(field) not in ("", None)), None)
 
 
-def thumbnails():
+def thumbnails(s3):
+    from thumbs import load_state
+
     images = {}
     for path in glob.glob("out/thumbs-*.json"):
-        folder = path[:-5]
         for key, value in json.load(open(path)).items():
-            file = os.path.join(folder, value["image"] + ".jpg")
-            if value.get("source") and os.path.exists(file):
-                images[key] = (value["image"], file)
+            if value.get("source"):
+                images[key] = value["image"]
+    for key, value in load_state(s3)[1].items():
+        if value.get("source"):
+            images[key] = value["image"]
     return images
 
 
-def upload_images(s3, images):
-    if not s3:
-        return
-    existing = set()
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket="openkogama", Prefix=PREFIX + "images/"):
-        existing.update(item["Key"] for item in page.get("Contents", []))
-    for uuid, file in {uuid: file for uuid, file in images.values()}.items():
-        key = f"{PREFIX}images/{uuid}.jpg"
-        if key not in existing:
-            upload_file(s3, key, file, "image/jpeg", IMMUTABLE)
-
-
 def index(build, source):
-    images = thumbnails()
+    s3 = client()
+    images = thumbnails(s3)
     games = unique_games() if source is None else sorted({g["sha256"]: g for g in json.load(open(source, encoding="utf-8"))["games"] if g.get("urls") and g.get("sha256")}.values(), key=lambda g: g["sha256"])
     groups = grouped(games)
     groups.sort(key=lambda group: (-(pick(group, "plays") or -1), text(group[0].get("name")).casefold()))
@@ -110,7 +102,7 @@ def index(build, source):
             best.get("format") or "",
             best.get("size") or 0,
             len(group),
-            images.get(f"{pick(group, 'site') or ''}:{pick(group, 'id') or ''}", ("", ""))[0],
+            images.get(f"{pick(group, 'site') or ''}:{pick(group, 'id') or ''}", ""),
         ])
         details.append([
             text(pick(group, "description")),
@@ -138,8 +130,6 @@ def index(build, source):
     with open("out/maps/latest.json", "w", encoding="utf-8") as f:
         json.dump(latest, f)
 
-    s3 = client()
-    upload_images(s3, images)
     if os.path.exists("captures.json.gz"):
         upload_file(s3, PREFIX + "captures.json.gz", "captures.json.gz", "application/gzip", SHORT)
     base = build_prefix(build, PREFIX)
