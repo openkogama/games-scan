@@ -1,0 +1,87 @@
+name: maps
+
+on:
+  workflow_dispatch:
+    inputs:
+      thumbnails:
+        description: "look up map thumbnails in archived game pages"
+        type: boolean
+        default: true
+      refresh:
+        description: "list archived game pages again instead of using captures.json.gz"
+        type: boolean
+        default: false
+
+env:
+  R2_ACCOUNT_ID: f1b5019a1d5ee73f9494a30464733335
+
+jobs:
+  captures:
+    if: inputs.thumbnails && inputs.refresh
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python thumbs.py --captures --shard ${{ matrix.shard }} --shards 8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: captures-${{ matrix.shard }}
+          path: out/captures-${{ matrix.shard }}.json
+
+  thumbs:
+    needs: captures
+    if: ${{ !cancelled() && inputs.thumbnails }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        if: inputs.refresh
+        with:
+          pattern: captures-*
+          path: captures
+          merge-multiple: true
+      - run: |
+          python maps.py --build index
+          python thumbs.py --fetch --shard ${{ matrix.shard }} --shards 16
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thumbs-${{ matrix.shard }}
+          path: |
+            out/thumbs-${{ matrix.shard }}.json
+            out/thumbs-${{ matrix.shard }}
+
+  index:
+    needs: thumbs
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: thumbs-*
+          path: out
+          merge-multiple: true
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python maps.py --build ${{ github.run_id }}
+          python maps.py --publish
