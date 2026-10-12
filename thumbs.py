@@ -169,11 +169,16 @@ def load_captures():
 
 
 STATE = "maps/v1/thumbs/"
+RUN = os.environ.get("GITHUB_RUN_ID", "local")
 IMAGES = "maps/v1/images/"
 
 
 def load_state(s3):
     pages, stored = set(), {}
+    for path in glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thumbs", "*.json")):
+        state = json.load(open(path))
+        pages.update(state["pages"])
+        stored.update(state["stored"])
     if not s3:
         return pages, stored
     from scan import BUCKET
@@ -218,7 +223,7 @@ def fetch(shard, shards, index_path, limit, minutes):
                 return
             saved[0] = time.time()
             data = json.dumps(mine).encode()
-        upload(s3, f"{STATE}shard-{shard}-of-{shards}.json", data, "application/json", SHORT)
+        upload(s3, f"{STATE}{RUN}-shard-{shard}-of-{shards}.json", data, "application/json", SHORT)
         with open(f"out/thumbs-{shard}.json", "w") as f:
             json.dump(mine["stored"], f)
 
