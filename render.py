@@ -29,6 +29,7 @@ NEAR = 0.05
 MAX_TRIANGLES = 200_000
 AVATAR_MAGIC = b"OKA1"
 AVATAR_TURN = 180.0
+MODEL_TURN = 180.0 - TURN
 
 FACES = [
     ([0, 1, 2, 3], (0, 1, 0), 1, 2),
@@ -115,7 +116,7 @@ def quaternion_matrix(x, y, z, w):
 def parts_of(data):
     if data[:4] != AVATAR_MAGIC:
         scale, cube_data = split_blob(data)
-        return [(cubes_of(cube_data), scale, np.eye(3), np.zeros(3))], 0.0
+        return [(cubes_of(cube_data), scale, np.eye(3), np.zeros(3))], MODEL_TURN
     pos = 5
     parts = []
     for _ in range(data[4]):
@@ -324,6 +325,7 @@ def main():
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--shards", type=int, default=1)
     p.add_argument("--upload", action="store_true")
+    p.add_argument("--images", default="images/")
     args = p.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -359,7 +361,7 @@ def main():
 
         def send(name):
             with open(os.path.join(args.out, name), "rb") as f:
-                upload(s3, build_prefix(build, prefix) + "images/" + name, f.read(), "image/png", IMMUTABLE)
+                upload(s3, build_prefix(build, prefix) + args.images + name, f.read(), "image/png", IMMUTABLE)
 
         with ThreadPoolExecutor(16) as pool:
             list(pool.map(send, images))
