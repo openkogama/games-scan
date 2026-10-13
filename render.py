@@ -19,6 +19,7 @@ SIZE = 256
 SUPERSAMPLE = 2
 FIELD_OF_VIEW = 35.0
 CAMERA_OFFSET = np.array([float(v) for v in os.environ.get("RENDER_CAMERA", "4.57,2.0,0.15").split(",")])
+MODEL_CAMERA = np.array([float(v) for v in os.environ.get("RENDER_MODEL_CAMERA", "2.4,2.6,-3.8").split(",")])
 PREVIEW_SIZE = 2.0
 TURN = float(os.environ.get("RENDER_TURN", "-45.0"))
 LIGHT_EULER = (50.0, -30.0)
@@ -193,7 +194,7 @@ def render(data, materials, size=SIZE):
     normals /= lengths[keep][:, None]
     normals[np.einsum("ij,ij->i", normals, face_normals @ rotation.T) < 0] *= -1
 
-    eye = CAMERA_OFFSET
+    eye = CAMERA_OFFSET if data[:4] == AVATAR_MAGIC else MODEL_CAMERA
     forward = -eye / np.linalg.norm(eye)
     right = np.cross([0.0, 1.0, 0.0], forward)
     right /= np.linalg.norm(right)
