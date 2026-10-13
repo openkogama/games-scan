@@ -1,0 +1,52 @@
+name: front
+
+on:
+  workflow_dispatch:
+
+env:
+  ATLAS: https://cdn.openkogama.org/eu/kogama_assets/v96/kogama_assets_u5/AssetBundles/Atlas/atlasmid.unity3d
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy Pillow UnityPy
+      - run: curl -sSfL -o atlasmid.unity3d "$ATLAS"
+      - run: python materials.py --atlas atlasmid.unity3d
+      - run: |
+          python - <<'PY'
+          import json, os, struct, urllib.request
+          def get(url):
+              return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "games-scan"}), timeout=120).read()
+          latest = json.loads(get("https://cdn.openkogama.org/avatars/v1/latest.json"))
+          base = f"https://cdn.openkogama.org/avatars/v1/builds/{latest['build']}/"
+          cards = latest["cards"]
+          size, per, total = cards["record"], cards.get("perFile") or latest["avatars"], latest["avatars"]
+          models = []
+          for part in range((total + per - 1) // per):
+              data = get(f"{base}{cards['path']}{part:03x}.bin")
+              for at in range(0, len(data) - size + 1, size):
+                  pack, = struct.unpack_from("<H", data, at + 42)
+                  offset, length = struct.unpack_from("<II", data, at + 44)
+                  models.append({"sha256": data[at:at + 32].hex(), "pack": pack, "offset": offset, "length": length})
+          os.makedirs("out", exist_ok=True)
+          json.dump({"build": latest["build"], "prefix": "avatars/v1/", "models": models}, open("out/front.json", "w"))
+          print(len(models), "avatars")
+          PY
+      - env:
+          RENDER_TURN: "-90"
+          RENDER_CAMERA: "4.7,0.6,0"
+        run: python render.py --catalog out/front.json --out out/front --shard ${{ matrix.shard }} --shards 20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: front-${{ matrix.shard }}
+          path: out/front
