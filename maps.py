@@ -3,6 +3,7 @@ import glob
 import html
 import json
 import os
+import shutil
 import sys
 
 from models import IMMUTABLE, SHORT, build_prefix, publish, repaired, unique_games, upload_file
@@ -13,6 +14,7 @@ FORMAT = 1
 DETAILS = ["description", "created", "published", "versions"]
 VERSION = ["sha256", "format", "size", "savedAt", "exporter", "urls"]
 PER_FILE = 1024
+HASH_PREFIX = 2
 FIELDS = ["id", "site", "name", "author", "authorId", "plays", "likes", "published", "format", "size", "versions", "image"]
 
 
@@ -87,9 +89,12 @@ def index(build, source):
     games = unique_games() if source is None else sorted({g["sha256"]: g for g in json.load(open(source, encoding="utf-8"))["games"] if g.get("urls") and g.get("sha256")}.values(), key=lambda g: g["sha256"])
     groups = grouped(games)
     groups.sort(key=lambda group: (-(pick(group, "plays") or -1), text(group[0].get("name")).casefold()))
-    rows, details = [], []
+    rows, details, hashes = [], [], {}
     for group in groups:
         best = group[0]
+        image = images.get(f"{pick(group, 'site') or ''}:{pick(group, 'id') or ''}", "")
+        for game in group:
+            hashes.setdefault(game["sha256"][:HASH_PREFIX], {})[game["sha256"]] = [len(rows), image]
         rows.append([
             pick(group, "id") or "",
             pick(group, "site") or "",
@@ -102,7 +107,7 @@ def index(build, source):
             best.get("format") or "",
             best.get("size") or 0,
             len(group),
-            images.get(f"{pick(group, 'site') or ''}:{pick(group, 'id') or ''}", ""),
+            image,
         ])
         details.append([
             text(pick(group, "description")),
@@ -112,6 +117,11 @@ def index(build, source):
         ])
 
     os.makedirs("out/maps/details", exist_ok=True)
+    shutil.rmtree("out/maps/hashes", ignore_errors=True)
+    os.makedirs("out/maps/hashes")
+    for prefix, entries in hashes.items():
+        with open(f"out/maps/hashes/{prefix}.json", "w", encoding="utf-8") as f:
+            json.dump(entries, f, separators=(",", ":"))
     with open("out/maps/index.json", "w", encoding="utf-8") as f:
         json.dump({"fields": FIELDS, "rows": rows}, f, ensure_ascii=False, separators=(",", ":"))
     for number_, start in enumerate(range(0, len(details), PER_FILE)):
@@ -126,6 +136,7 @@ def index(build, source):
         "index": {"path": "index.json", "bytes": os.path.getsize("out/maps/index.json")},
         "images": {"path": "../../images/", "count": sum(1 for row in rows if row[-1])},
         "details": {"path": "details/", "perFile": PER_FILE, "fields": DETAILS, "version": VERSION},
+        "hashes": {"path": "hashes/", "prefix": HASH_PREFIX, "value": ["position", "image"]},
     }
     with open("out/maps/latest.json", "w", encoding="utf-8") as f:
         json.dump(latest, f)
@@ -136,6 +147,8 @@ def index(build, source):
     upload_file(s3, base + "index.json", "out/maps/index.json", "application/json; charset=utf-8", IMMUTABLE)
     for name in sorted(os.listdir("out/maps/details")):
         upload_file(s3, base + "details/" + name, os.path.join("out/maps/details", name), "application/json; charset=utf-8", IMMUTABLE)
+    for name in sorted(os.listdir("out/maps/hashes")):
+        upload_file(s3, base + "hashes/" + name, os.path.join("out/maps/hashes", name), "application/json; charset=utf-8", IMMUTABLE)
     print(f"{len(rows)} maps, index {latest['index']['bytes'] // 1024} KB, {len(os.listdir('out/maps/details'))} detail files")
 
 
