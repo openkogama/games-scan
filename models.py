@@ -354,6 +354,41 @@ def search_database(words):
     db.close()
 
 
+def links_database(path, links):
+    if os.path.exists(path):
+        os.remove(path)
+    db = sqlite3.connect(path)
+    db.execute(f"PRAGMA page_size = {PAGE_SIZE}")
+    db.execute("PRAGMA journal_mode = DELETE")
+    db.execute("CREATE TABLE links (item INTEGER NOT NULL, map INTEGER NOT NULL, PRIMARY KEY (item, map)) WITHOUT ROWID")
+    db.executemany("INSERT INTO links VALUES (?, ?)", links)
+    db.execute("CREATE INDEX links_map ON links(map, item)")
+    db.commit()
+    db.execute("VACUUM")
+    db.close()
+
+
+def store_links(s3, base, items, games, prefix=""):
+    database, names = f"out/{prefix}links.db", f"out/{prefix}names.json"
+    used = set()
+
+    def links():
+        for item, found in items:
+            for game in sorted(set(found)):
+                used.add(game)
+                yield item, game + 1
+
+    links_database(database, links())
+    titles = [""] * (len(games) + 1)
+    for game in used:
+        titles[game + 1] = repaired(games[game].get("name") or "")
+    with open(names, "w", encoding="utf-8") as f:
+        json.dump(titles, f, ensure_ascii=False, separators=(",", ":"))
+    upload_file(s3, base + "links.bin", database, "application/octet-stream", IMMUTABLE)
+    upload_file(s3, base + "names.json", names, "application/json; charset=utf-8", IMMUTABLE)
+    return {"path": "links.bin", "bytes": os.path.getsize(database), "pageSize": PAGE_SIZE, "names": "names.json"}
+
+
 def scale_word(scale):
     return "zzscale" + f"{scale:g}".replace(".", "")
 
@@ -439,6 +474,7 @@ def index(paths, build):
     for name in sorted(os.listdir("out/cards")):
         upload_file(s3, base + "cards/" + name, os.path.join("out/cards", name), "application/octet-stream", IMMUTABLE)
     upload_file(s3, base + "maps.json", "out/maps.json", "application/json; charset=utf-8", IMMUTABLE)
+    links = store_links(s3, base, ((rank, models[sha]["games"]) for rank, sha in enumerate(order, 1)), games)
     materials = {}
     if os.path.exists("out/materials/materials.json"):
         with open("out/materials/materials.json", encoding="utf-8") as f:
@@ -457,6 +493,7 @@ def index(paths, build):
         "search": {"path": "search.bin", "bytes": os.path.getsize("out/search.db"), "pageSize": PAGE_SIZE},
         "cards": {"path": "cards/", "record": CARD.size, "perFile": CARDS_PER_FILE},
         "titles": "maps.json",
+        "links": links,
         "materials": {key: value for key, value in materials.items() if key != "colors"},
     }
     with open("out/latest.json", "w", encoding="utf-8") as f:

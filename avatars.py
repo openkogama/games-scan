@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from datahash import batches_of, get, parse
 from models import (BUCKETS, IMMUTABLE, PACKS, PAGE_SIZE, build_prefix, canonical, client, cubes_of, model_blob, pack, publish,
-                    repaired, unique_games, upload_file)
+                    repaired, store_links, unique_games, upload_file)
 
 PREFIX = "avatars/v1/"
 MAGIC = b"OKA1"
@@ -353,6 +353,7 @@ def index(paths, build):
     for card_file in sorted(os.listdir("out/avatar-cards")):
         upload_file(s3, base + "cards/" + card_file, os.path.join("out/avatar-cards", card_file), "application/octet-stream", IMMUTABLE)
     upload_file(s3, base + "maps.json", "out/avatar-maps.json", "application/json; charset=utf-8", IMMUTABLE)
+    links = store_links(s3, base, ((rank, avatars[sha]["games"]) for rank, sha in enumerate(order, 1)), games, "avatar-")
     materials = {}
     if os.path.exists("out/materials/materials.json"):
         with open("out/materials/materials.json", encoding="utf-8") as f:
@@ -374,6 +375,7 @@ def index(paths, build):
         "search": {"path": "search.bin", "table": "avatar_search", "bytes": os.path.getsize("out/avatar-search.db"), "pageSize": PAGE_SIZE},
         "cards": {"path": "cards/", "record": CARD.size, "perFile": CARDS_PER_FILE},
         "titles": "maps.json",
+        "links": links,
         "materials": {key: value for key, value in materials.items() if key != "colors"},
     }
     with open("out/latest.json", "w", encoding="utf-8") as f:

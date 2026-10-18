@@ -1,0 +1,40 @@
+name: links
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "catalog to add map links to"
+        type: choice
+        options: [models, avatars]
+      run:
+        description: "id of the run that built the catalog"
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  R2_ACCOUNT_ID: f1b5019a1d5ee73f9494a30464733335
+
+jobs:
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.kind }}-*
+          path: shards
+          merge-multiple: true
+          run-id: ${{ inputs.run }}
+          github-token: ${{ github.token }}
+      - env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python links.py --kind ${{ inputs.kind }} --build ${{ inputs.run }} shards/*.json
