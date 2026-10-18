@@ -90,11 +90,14 @@ def index(build, source):
     groups = grouped(games)
     groups.sort(key=lambda group: (-(pick(group, "plays") or -1), text(group[0].get("name")).casefold()))
     rows, details, hashes = [], [], {}
+    at = {game["sha256"]: number for number, game in enumerate(games)}
+    positions = [0] * len(games)
     for group in groups:
         best = group[0]
         image = images.get(f"{pick(group, 'site') or ''}:{pick(group, 'id') or ''}", "")
         for game in group:
             hashes.setdefault(game["sha256"][:HASH_PREFIX], {})[game["sha256"]] = [len(rows), image]
+            positions[at[game["sha256"]]] = len(rows)
         rows.append([
             pick(group, "id") or "",
             pick(group, "site") or "",
@@ -124,6 +127,8 @@ def index(build, source):
             json.dump(entries, f, separators=(",", ":"))
     with open("out/maps/index.json", "w", encoding="utf-8") as f:
         json.dump({"fields": FIELDS, "rows": rows}, f, ensure_ascii=False, separators=(",", ":"))
+    with open("out/maps/rows.json", "w", encoding="utf-8") as f:
+        json.dump(positions, f, separators=(",", ":"))
     for number_, start in enumerate(range(0, len(details), PER_FILE)):
         with open(f"out/maps/details/{number_:03x}.json", "w", encoding="utf-8") as f:
             json.dump(details[start : start + PER_FILE], f, ensure_ascii=False, separators=(",", ":"))
@@ -137,6 +142,7 @@ def index(build, source):
         "images": {"path": "../../images/", "count": sum(1 for row in rows if row[-1])},
         "details": {"path": "details/", "perFile": PER_FILE, "fields": DETAILS, "version": VERSION},
         "hashes": {"path": "hashes/", "prefix": HASH_PREFIX, "value": ["position", "image"]},
+        "rows": "rows.json",
     }
     with open("out/maps/latest.json", "w", encoding="utf-8") as f:
         json.dump(latest, f)
@@ -145,6 +151,7 @@ def index(build, source):
         upload_file(s3, PREFIX + "captures.json.gz", "captures.json.gz", "application/gzip", SHORT)
     base = build_prefix(build, PREFIX)
     upload_file(s3, base + "index.json", "out/maps/index.json", "application/json; charset=utf-8", IMMUTABLE)
+    upload_file(s3, base + "rows.json", "out/maps/rows.json", "application/json; charset=utf-8", IMMUTABLE)
     for name in sorted(os.listdir("out/maps/details")):
         upload_file(s3, base + "details/" + name, os.path.join("out/maps/details", name), "application/json; charset=utf-8", IMMUTABLE)
     for name in sorted(os.listdir("out/maps/hashes")):
