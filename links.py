@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 
 from datahash import get
@@ -42,6 +43,7 @@ def backfill(kind, build, paths):
     wrong = sum(1 for sha, (_, maps) in ids.items() if len(found.get(sha, ())) != maps)
     if wrong:
         sys.exit(f"{wrong} of {len(ids)} {kind} have another map count than the build")
+    os.makedirs("out", exist_ok=True)
     latest["links"] = store_links(s3, base, items, unique_games(), files)
     upload(s3, prefix + "latest.json", json.dumps(latest).encode(), "application/json", SHORT)
     print(f"{len(ids)} {kind}, links {latest['links']['bytes'] // 1024 // 1024} MB")
