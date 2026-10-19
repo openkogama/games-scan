@@ -16,6 +16,7 @@ env:
 
 jobs:
   render:
+    environment: r2
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -41,6 +42,7 @@ jobs:
         run: python render.py --catalog out/top.json --shard ${{ matrix.shard }} --shards 16 --upload --images ${{ inputs.images }}
 
   publish:
+    environment: r2
     runs-on: ubuntu-latest
     needs: render
     steps:
