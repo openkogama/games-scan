@@ -13,6 +13,7 @@ LISTS = {"games_www.txt": "www", "games_br.txt": "br", "games_friends.txt": "fri
 ENTITY = re.compile(r"&(#[0-9]+|[a-zA-Z]+);")
 PAIR = re.compile(r"^(?P<name>.*):(?P<id>[0-9]{2,9})(?::(?P<author>.*))?$")
 FIELDS = ("title", "description", "author", "author_id", "likes", "plays", "created_date", "published_date", "scraped_at", "status")
+SKIP_AUTHORS = set(filter(None, os.environ.get("SKIP_AUTHORS", "").split(",")))
 
 
 def clean(text):
@@ -91,13 +92,16 @@ def main():
             row = con.execute("SELECT * FROM games WHERE id = ?", (int(gid),)).fetchone()
             rows[gid] = dict(row) if row else {}
         db = rows.get(gid, {})
+        author_id = str(rec["authorId"] or db.get("author_id") or "")
+        if author_id in SKIP_AUTHORS:
+            continue
         name = rec["name"] or listed.get(gid, "") or (db.get("title") or "") or rec["fileName"]
         games.append(
             {
                 "id": gid,
                 "site": site,
                 "name": clean(name),
-                "authorId": str(rec["authorId"] or db.get("author_id") or ""),
+                "authorId": author_id,
                 "authorName": clean(authors.get(gid, "") or (db.get("author") or "")),
                 "description": clean(db.get("description") or ""),
                 "likes": db.get("likes"),
